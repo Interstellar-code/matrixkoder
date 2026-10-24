@@ -134,14 +134,25 @@ def load(path):
 
 def split_plan(text):
     """(lines, close): lines[0] is the opening +++, lines[close] the closing one.
-    A leading BOM stays on lines[0] so rewrites keep it; the +++ check ignores it."""
+    A leading BOM stays on lines[0] so rewrites keep it; the +++ check ignores it.
+    For block format (lines[0] starts with '+++ '), close is the line index of
+    the '/+++' closing Block 1."""
     lines = text.split("\n")
-    if not lines or lines[0].lstrip("\ufeff").strip() != "+++":
+    if not lines:
         raise Fail(["line 1: first line must be '+++'"])
-    for i in range(1, len(lines)):
-        if lines[i].strip() == "+++":
-            return lines, i
-    raise Fail([f"line {len(lines)}: no closing '+++' for the header"])
+    first = lines[0].lstrip("\ufeff").strip()
+    if first == "+++":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "+++":
+                return lines, i
+        raise Fail([f"line {len(lines)}: no closing '+++' for the header"])
+    elif first.startswith("+++ "):
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "/+++":
+                return lines, i
+        raise Fail([f"line {len(lines)}: no closing '/+++' for block 1"])
+    else:
+        raise Fail(["line 1: first line must be '+++'"])
 
 
 def parse_header(header_lines, start=2):
@@ -320,9 +331,416 @@ def plan_json(header, sha):
     return out
 
 
+def is_block_format(text):
+    if not text:
+        return False
+    first = text.lstrip("\ufeff").split("\n", 1)[0].strip()
+    return first.startswith("+++ ")
+
+
+def parse_blocks(text):
+    lines = text.split("\n")
+    blocks = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        st = line.strip()
+        m = re.match(r"^\+\+\+\s+([0-9.]+)\s+(.*?)(?:\s+\[toml\])?$", st)
+        if m:
+            num, name = m.group(1), m.group(2)
+            is_toml = st.endswith("[toml]")
+            start_line = i + 1
+            b_lines = []
+            i += 1
+            while i < len(lines) and lines[i].strip() != "/+++":
+                b_lines.append(lines[i])
+                i += 1
+            close_line = i + 1
+            blocks.append({
+                "num": num,
+                "name": name,
+                "is_toml": is_toml,
+                "start_line": start_line,
+                "close_line": close_line,
+                "lines": b_lines,
+                "text": "\n".join(b_lines)
+            })
+        i += 1
+    return blocks
+
+
+def _parse_toml_block(lines, start_line):
+    try:
+        clean = "\n".join(l[:-1] if l.endswith("\r") else l for l in lines)
+        return tomllib.loads(clean)
+    except tomllib.TOMLDecodeError as e:
+        rel = TOML_LINE_RE.search(str(e))
+        line = int(rel.group(1)) + start_line - 1 if rel else start_line
+        raise Fail([f"line {line}: {e}"])
+
+
+def read_block_plan(text, sha=""):
+    blocks = parse_blocks(text)
+    by_num = {b["num"]: b for b in blocks}
+
+    # 1. Top block
+    b1 = by_num.get("1")
+    if not b1:
+        for b in blocks:
+            if b["name"].lower().startswith("top block") or b["num"] == "1":
+                b1 = b
+                break
+    top_toml = _parse_toml_block(b1["lines"], b1["start_line"]) if b1 else {}
+
+    # 2. Summary
+    b2 = by_num.get("2")
+    if not b2:
+        for b in blocks:
+            if b["name"].lower().startswith("summary") or b["num"] == "2":
+                b2 = b
+                break
+    summary = {"title": "", "phases": "", "method": "", "lanes": "", "delivery": "", "gates": "", "raw": []}
+    if b2:
+        summary["raw"] = list(b2["lines"])
+        for line in b2["lines"]:
+            st = line.strip()
+            if st.startswith("# "):
+                summary["title"] = st[2:].strip()
+            m = re.match(r"^\s*-\s*(Phases|Method|Lanes|Delivery|Gates)\s*:\s*(.*)$", line)
+            if m:
+                summary[m.group(1).lower()] = m.group(2).strip()
+
+    # 3. Goal
+    b3 = by_num.get("3")
+    if not b3:
+        for b in blocks:
+            if b["name"].lower().startswith("goal") or b["num"] == "3":
+                b3 = b
+                break
+    goals = []
+    goal_meta = {"why": "", "from": "", "sources": "", "raw": []}
+    if b3:
+        goal_meta["raw"] = list(b3["lines"])
+        for line in b3["lines"]:
+            m = re.match(r"^\s*-\s*(G\d+)\s*[—–-]\s*(.*)$", line)
+            if m:
+                goals.append({"id": m.group(1), "text": m.group(2).strip(), "raw": line})
+            m2 = re.match(r"^\s*-\s*(Why|From|Sources)\s*:\s*(.*)$", line, re.I)
+            if m2:
+                goal_meta[m2.group(1).lower()] = m2.group(2).strip()
+
+    # 4. Design / context
+    b4 = by_num.get("4")
+    if not b4:
+        for b in blocks:
+            if b["name"].lower().startswith("design") or b["num"] == "4":
+                b4 = b
+                break
+    items = []
+    contracts, tests, assumptions, rollout, settings = [], [], [], [], []
+    if b4:
+        for line in b4["lines"]:
+            m = re.match(r"^\s*([CTARS]\d+)\s*[—–-]\s*(.*)$", line)
+            if m:
+                item_id, item_text = m.group(1), m.group(2).strip()
+                prefix = item_id[0]
+                type_map = {"C": "contract", "T": "test", "A": "assumption", "R": "rollout", "S": "setting"}
+                itype = type_map.get(prefix, "item")
+                entry = {"id": item_id, "type": itype, "text": item_text, "raw": line}
+                items.append(entry)
+                if prefix == "C":
+                    contracts.append(entry)
+                elif prefix == "T":
+                    tests.append(entry)
+                elif prefix == "A":
+                    assumptions.append(entry)
+                elif prefix == "R":
+                    rollout.append(entry)
+                elif prefix == "S":
+                    settings.append(entry)
+
+    # 6. Gates & 6.0 Gate settings
+    b6 = by_num.get("6")
+    b6_0 = by_num.get("6.0")
+    toml_6_0 = _parse_toml_block(b6_0["lines"], b6_0["start_line"]) if b6_0 else {}
+    gate_timeout = int(toml_6_0.get("timeout", 600))
+    extra_gates = toml_6_0.get("extra", {})
+    if not isinstance(extra_gates, dict):
+        extra_gates = {}
+    use_gates = as_list(toml_6_0.get("use"))
+
+    proves_map = {}
+    gate_lines_raw = []
+    if b6:
+        for line in b6["lines"]:
+            gate_lines_raw.append(line)
+            m = re.match(r"^\s*-\s*(\S+)\s*[—–-]\s*proves\s*(.*?)\s*[—–-]\s*(.*)$", line)
+            if m:
+                gname = m.group(1).strip()
+                proves_map[gname] = [p.strip() for p in m.group(2).split(",") if p.strip()]
+
+    # 5. Phases
+    phase_nums = []
+    for b in blocks:
+        m = re.match(r"^5\.(\d+)$", b["num"])
+        if m:
+            phase_nums.append((int(m.group(1)), b["num"]))
+    phase_nums.sort()
+
+    phases = []
+    all_task_ids = []
+    covers_map = {}
+    serves_map = {}
+
+    for p_int, p_num in phase_nums:
+        b_p = by_num.get(p_num)
+        b_p0 = by_num.get(f"{p_num}.0")
+        p_toml = _parse_toml_block(b_p0["lines"], b_p0["start_line"]) if b_p0 else {}
+
+        p_goal, p_serves, p_needs, p_build, p_hazards, p_carries = "", [], "", "", [], []
+        if b_p:
+            for line in b_p["lines"]:
+                m = re.match(r"^\s*-\s*(Goal|Serves|Needs first|Build order|Hazards|Carries)\s*:\s*(.*)$", line)
+                if m:
+                    k, v = m.group(1), m.group(2).strip()
+                    if k == "Goal": p_goal = v
+                    elif k == "Serves": p_serves = [x.strip() for x in v.split(",") if x.strip()]
+                    elif k == "Needs first": p_needs = v
+                    elif k == "Build order": p_build = v
+                    elif k == "Hazards": p_hazards = [x.strip() for x in v.split(",") if x.strip()]
+                    elif k == "Carries": p_carries = [x.strip() for x in v.split(",") if x.strip()]
+
+        pid = str(p_toml.get("id", ""))
+        serves_map[pid] = p_serves
+
+        task_nums = []
+        for b in blocks:
+            m = re.match(rf"^5\.{p_int}\.([1-9]\d*)$", b["num"])
+            if m:
+                task_nums.append((int(m.group(1)), b["num"]))
+        task_nums.sort()
+
+        tasks = []
+        for t_int, t_num in task_nums:
+            b_t = by_num.get(t_num)
+            t_toml = _parse_toml_block(b_t["lines"], b_t["start_line"]) if b_t else {}
+            tid = str(t_toml.get("id", ""))
+            all_task_ids.append(tid)
+
+            t_covers = as_list(t_toml.get("covers"))
+            covers_map[tid] = t_covers
+
+            sub_nums = []
+            for b in blocks:
+                m = re.match(rf"^5\.{p_int}\.{t_int}\.([1-9]\d*)$", b["num"])
+                if m:
+                    sub_nums.append((int(m.group(1)), b["num"]))
+            sub_nums.sort()
+
+            subtasks = []
+            for s_int, s_num in sub_nums:
+                b_s = by_num.get(s_num)
+                s_toml = _parse_toml_block(b_s["lines"], b_s["start_line"]) if b_s else {}
+                sid = str(s_toml.get("id", ""))
+                s_acc_text, s_acc_lines = acceptance_lines_of(sid, s_toml.get("acceptance"))
+                subtasks.append({
+                    "id": sid,
+                    "title": s_toml.get("title", ""),
+                    "description": s_toml.get("description", ""),
+                    "acceptance": s_acc_text,
+                    "acceptance_lines": s_acc_lines,
+                    "deps": deps_list(s_toml.get("deps")),
+                    "parallel": parallel_of(s_toml),
+                    "route": route_of(s_toml),
+                    "owned": as_list(s_toml.get("owned")),
+                    "refs": as_list(s_toml.get("refs")),
+                })
+
+            t_acc_text, t_acc_lines = acceptance_lines_of(tid, t_toml.get("acceptance"))
+            raw_gate = t_toml.get("gate")
+            if isinstance(raw_gate, str) and raw_gate.strip():
+                t_gate = [{"cmd": raw_gate.strip(), "expect": 0, "timeout": gate_timeout, "lines": []}]
+            elif isinstance(raw_gate, list):
+                t_gate = gate_list_of(raw_gate)
+            else:
+                t_gate = []
+
+            task_obj = {
+                "id": tid,
+                "title": t_toml.get("title", ""),
+                "description": t_toml.get("description", ""),
+                "covers": t_covers,
+                "acceptance": t_acc_text,
+                "acceptance_lines": t_acc_lines,
+                "risk": t_toml.get("risk", 1),
+                "size": t_toml.get("size", p_toml.get("size", "standard")),
+                "gate": t_gate,
+                "manual": t_toml.get("manual", ""),
+                "deps": deps_list(t_toml.get("deps")),
+                "parallel": parallel_of(t_toml),
+                "route": route_of(t_toml),
+                "refs": as_list(t_toml.get("refs")),
+                "subagent": bool(t_toml.get("subagent", False)),
+                "owned": as_list(t_toml.get("owned")),
+                "subtasks": subtasks,
+            }
+            for k, v in t_toml.items():
+                if k not in task_obj and k != "critical":
+                    task_obj[k] = jsonable(v)
+            tasks.append(task_obj)
+
+        phase_obj = {
+            "id": pid,
+            "title": p_toml.get("title", ""),
+            "wave": p_toml.get("wave", 1),
+            "owned": as_list(p_toml.get("owned")),
+            "forbidden": as_list(p_toml.get("forbidden")),
+            "commit": p_toml.get("commit", ""),
+            "deps": deps_list(p_toml.get("deps")),
+            "route": route_of(p_toml),
+            "reviewer": p_toml.get("reviewer", ""),
+            "size": p_toml.get("size", "standard"),
+            "subagents": bool(p_toml.get("subagents", False)),
+            "lane_group": p_toml.get("lane_group", ""),
+            "qa": as_list(p_toml.get("qa")),
+            "parallel": parallel_of(p_toml),
+            "goal": p_goal,
+            "serves": p_serves,
+            "needs_first": p_needs,
+            "build_order": p_build,
+            "hazards": p_hazards,
+            "carries": p_carries,
+            "tasks": tasks,
+        }
+        for k, v in p_toml.items():
+            if k not in phase_obj and k not in ("risk", "review"):
+                phase_obj[k] = jsonable(v)
+        phases.append(phase_obj)
+
+    gate_names = []
+    for g in use_gates:
+        if g not in gate_names:
+            gate_names.append(g)
+    for g in extra_gates.keys():
+        if g not in gate_names:
+            gate_names.append(g)
+    for g in proves_map.keys():
+        if g not in gate_names:
+            gate_names.append(g)
+
+    final_gates = []
+    gates_dict = {}
+    for gname in gate_names:
+        cmd = extra_gates.get(gname)
+        final_gates.append({
+            "id": gname,
+            "cmd": cmd,
+            "expect": 0,
+            "every": "run_end",
+            "timeout": gate_timeout,
+            "needs": [],
+            "covers": list(all_task_ids),
+            "proves": proves_map.get(gname, []),
+        })
+        gates_dict[gname] = {"cmd": cmd, "expect": 0, "timeout": gate_timeout} if cmd else gname
+
+    # 7. Risks
+    b7 = by_num.get("7")
+    risks = []
+    if b7:
+        for line in b7["lines"]:
+            m = re.match(r"^\s*-\s*(K\d+)\s*[—–-]\s*(.*?)\s*[—–-]\s*level\s*(\S+)\s*[—–-]\s*guard:\s*(.*?)\s*[—–-]\s*(\S+)\s*$", line)
+            if m:
+                risks.append({
+                    "id": m.group(1),
+                    "what": m.group(2).strip(),
+                    "level": int(m.group(3)) if m.group(3).isdigit() else m.group(3),
+                    "guard": m.group(4).strip(),
+                    "target": m.group(5).strip(),
+                    "raw": line
+                })
+
+    # 8. Open questions
+    b8 = by_num.get("8")
+    questions = []
+    if b8:
+        for line in b8["lines"]:
+            m = re.match(r"^\s*-\s*\[([ xX])\]\s*(Q\d+)\s*[—–-]\s*(.*?)\s*[—–-]\s*blocks:\s*(\S+)\s*[—–-]\s*pick:\s*(.*)$", line)
+            if m:
+                questions.append({
+                    "id": m.group(2),
+                    "ticked": m.group(1).lower() == "x",
+                    "question": m.group(3).strip(),
+                    "blocks": m.group(4).strip(),
+                    "pick": m.group(5).strip(),
+                    "raw": line
+                })
+
+    # 9. Log
+    b9 = by_num.get("9")
+    log = []
+    if b9:
+        for line in b9["lines"]:
+            m = re.match(r"^\s*-\s*(\S+)\s*[—–-]\s*(\S+)\s*[—–-]\s*(.*?)\s*[—–-]\s*(\S+)\s*$", line)
+            if m:
+                log.append({
+                    "date": m.group(1),
+                    "kind": m.group(2),
+                    "text": m.group(3).strip(),
+                    "who": m.group(4),
+                    "raw": line
+                })
+
+    out = {
+        "ok": True,
+        "block_format": True,
+        "plan": str(top_toml.get("plan", "")),
+        "status": str(top_toml.get("status", "draft")),
+        "created": jsonable(top_toml.get("created", "")),
+        "runs": as_list(top_toml.get("runs")),
+        "sha": sha,
+        "pushed": bool(top_toml.get("pushed", False)),
+        "reviewer": str(top_toml.get("reviewer", "")),
+        "gates": gates_dict,
+        "final_gates": final_gates,
+        "phases": phases,
+        "goals": goals,
+        "goal_meta": goal_meta,
+        "items": items,
+        "contracts": contracts,
+        "tests": tests,
+        "assumptions": assumptions,
+        "rollout": rollout,
+        "settings": settings,
+        "risks": risks,
+        "questions": questions,
+        "log": log,
+        "summary": summary,
+        "serves": serves_map,
+        "covers": covers_map,
+        "proves": proves_map,
+    }
+    for k, v in top_toml.items():
+        if k not in out:
+            out[k] = jsonable(v)
+
+    header = dict(top_toml)
+    header["phase"] = []
+    for p in phases:
+        ph_dict = dict(p)
+        ph_dict["task"] = [dict(t) for t in p["tasks"]]
+        header["phase"].append(ph_dict)
+    header["gates"] = gates_dict
+    header["final_gate"] = final_gates
+
+    return header, out, sha
+
+
 def read_plan(path):
     """parse shared by parse/check/set/add-run: → (header dict, C2 dict, sha)."""
     text, sha = load(path)
+    if is_block_format(text):
+        return read_block_plan(text, sha)
     lines, close = split_plan(text)
     header = parse_header(lines[1:close])
     return header, plan_json(header, sha), sha
@@ -508,6 +926,10 @@ def summary_drift(out, body):
     return warnings
 
 
+def is_placeholder(v):
+    return isinstance(v, str) and v.startswith("<") and v.endswith(">")
+
+
 def check_plan(header, out, body=None):
     """→ (errors, warnings). Errors are exactly the P1.2 contract rules; anything
     advisory (cross-run deps, malformed id shapes) is a warning. `body` is the markdown
@@ -518,7 +940,8 @@ def check_plan(header, out, body=None):
     raw = as_list(header.get("phase"))
 
     if str(out["plan"]) and not PLAN_ID_RE.fullmatch(str(out["plan"])):
-        warnings.append(f"plan id {out['plan']!r} does not match [a-z0-9][a-z0-9-]{{0,40}}")
+        if not is_placeholder(out["plan"]):
+            warnings.append(f"plan id {out['plan']!r} does not match [a-z0-9][a-z0-9-]{{0,40}}")
     if _mkdb().is_bugs_run(str(out["plan"])):
         errors.append(RESERVED_PLAN_ERR)
 
@@ -554,7 +977,7 @@ def check_plan(header, out, body=None):
                         "D1, header_json until then) — the date the plan was drafted")
     if body is not None and not has_h1(body):
         warnings.append("body has no H1 line; the first '# ' line is what becomes plans.title")
-    if not str(header.get("description") or "").strip():
+    if not out.get("block_format") and not str(header.get("description") or "").strip():
         warnings.append("no description key in the header; advised: two to five plain sentences "
                         "(plans.header_json only)")
     # TPL.2: a plan created on or after NEW_PLAN_FROM gets the REQUIRED keys as errors; an older or
@@ -588,7 +1011,7 @@ def check_plan(header, out, body=None):
         for key in ("title", "wave", "owned", "commit"):
             if key not in rp:
                 strict.append(f"{pid}: no {key} key (required in a plan created on or after {NEW_PLAN_FROM})")
-        if not str(rp.get("description") or "").strip():
+        if not out.get("block_format") and not str(rp.get("description") or "").strip():
             warnings.append(f"{pid}: no description; advised: two to five plain sentences")
         w = raw[n].get("wave", 1) if n < len(raw) else 1
         if not isinstance(w, int) or isinstance(w, bool) or w < 1:
@@ -605,12 +1028,16 @@ def check_plan(header, out, body=None):
                     errors.append(f"{pid}: dep {d} is in a later wave ({by_id[d]['wave']} > {p['wave']})")
             else:
                 errors.append(f"{pid}: unknown dep {d}")
-        if p["size"] not in SIZES:
-            errors.append(f"{pid}: bad size {p['size']!r} ({'|'.join(SIZES)})")
-        if p["risk"] not in RISKS:
-            errors.append(f"{pid}: bad risk {p['risk']!r} ({'|'.join(RISKS)})")
-        if p["review"] not in REVIEWS:
-            errors.append(f"{pid}: bad review {p['review']!r} ({'|'.join(REVIEWS)})")
+        if not out.get("block_format"):
+            if p["size"] not in SIZES:
+                errors.append(f"{pid}: bad size {p['size']!r} ({'|'.join(SIZES)})")
+            if p["risk"] not in RISKS:
+                errors.append(f"{pid}: bad risk {p['risk']!r} ({'|'.join(RISKS)})")
+            if p["review"] not in REVIEWS:
+                errors.append(f"{pid}: bad review {p['review']!r} ({'|'.join(REVIEWS)})")
+        else:
+            if p.get("size") and p["size"] not in SIZES:
+                errors.append(f"{pid}: bad size {p['size']!r} ({'|'.join(SIZES)})")
         if p["route"] != "" and not ROUTE_RE.fullmatch(str(p["route"])):
             errors.append(f'{pid}: bad route {p["route"]!r} ("" or "<agent> <model> [<effort>]")')
         if not isinstance(p["reviewer"], str):
@@ -720,7 +1147,10 @@ def check_gate_fields(out, errors, warnings):
         if gates and manual:
             errors.append(f"{rid}: gate and manual are exclusive; pick one")
         elif not gates and not manual:
-            warnings.append(f"{rid}: neither gate nor manual line")
+            if not out.get("block_format"):
+                warnings.append(f"{rid}: neither gate nor manual line")
+            elif t.get("subtasks") is not None and t.get("risk", 1) >= 3:
+                warnings.append(f"{rid}: neither gate nor manual line")
         lines = {ln["id"] for ln in t.get("acceptance_lines") or []}
         for i, g in enumerate(gates):
             glabel = f"{tid} gate" if len(gates) == 1 else f"{rid} gate {i + 1}"
@@ -755,7 +1185,8 @@ def check_gate_fields(out, errors, warnings):
             continue
         label = f"final gate {final_gate_id(g, i)}"
         if not isinstance(g.get("cmd"), str) or not g["cmd"].strip():
-            errors.append(f"{label}: needs cmd (a non-empty string)")
+            if not (out.get("block_format") and g.get("cmd") is None):
+                errors.append(f"{label}: needs cmd (a non-empty string)")
         if type(g.get("expect")) is not int:
             errors.append(f"{label}: expect must be an int, not {g.get('expect')!r}")
         if type(g.get("timeout")) is not int:
@@ -946,7 +1377,8 @@ def cmd_parse(a):
 def cmd_check(a):
     if a.classify:  # a file with no +++ first line is a class (not_a_plan), not an error
         text, sha = load(a.path)
-        if text.lstrip("﻿").split("\n", 1)[0].strip() != "+++":
+        first = text.lstrip("\ufeff").split("\n", 1)[0].strip()
+        if first != "+++" and not first.startswith("+++ "):
             return {"ok": True, "plan": "", "sha": sha, "warnings": [],
                     **classify({"phases": [], "final_gates": []}, text)}
     header, out, _ = read_plan(a.path)
@@ -1960,11 +2392,15 @@ def import_file(path, data, home, dry_run=False):
     # a file that is not a plan, or a header that does not parse, is refused with the reason in
     # the reply and exit 0 — it is a "this file is not importable" answer, not a failed command.
     try:
-        lines, close = split_plan(text)
-        header = parse_header(lines[1:close])
+        if is_block_format(text):
+            header, out, _ = read_block_plan(text, sha)
+            _lines, close = split_plan(text)
+        else:
+            lines, close = split_plan(text)
+            header = parse_header(lines[1:close])
+            out = plan_json(header, sha)
     except Fail as e:
         raise Fail(e.errors, code=0, reason=e.errors[0])
-    out = plan_json(header, sha)
     plan_id = str(out["plan"])
     if not plan_id:
         raise Fail(["the header has no plan id (C4: only a +++ file with plan = \"<id>\" imports)"],

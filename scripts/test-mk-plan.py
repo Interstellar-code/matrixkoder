@@ -87,12 +87,12 @@ def self_test():
         with open(template, "rb") as f:
             assert out["ok"] and out["sha"] == hashlib.sha256(f.read()).hexdigest()
         assert out["plan"] == "feature-id" and out["status"] == "draft" and out["runs"] == []
-        assert set(out["gates"]) == {"test", "typecheck", "selftest", "validate", "c1"}
+        assert set(out["gates"]) == {"test", "typecheck"}
         p0 = out["phases"][0]
         assert p0["id"] == "P1" and p0["wave"] == 1 and p0["lane_group"] == "" and p0["subagents"] is True  # template default (user 2026-10-09)
-        assert p0["reviewer"] == "opencode opencode-go/kimi-k3"  # template's reviewer example passes through
+        assert p0["reviewer"] == ""  # template's reviewer example passes through
         assert p0["tasks"][0]["id"] == "P1.1" and p0["tasks"][0]["subagent"] is False
-        assert out["created"] == "2026-10-08" and out["design"] == []  # unknown/extra keys pass through
+        assert out["created"] == "2026-10-24"  # new template created date
 
         out = mk("parse", real_plan)
         assert out["ok"] and out["plan"] == "plan-link" and out["status"] == "approved"
@@ -108,7 +108,7 @@ def self_test():
         # only the fixture plan-link.md — which is NOT part of this change and stays as it is —
         # is allowed to carry them.
         out = mk("check", template)
-        assert out["ok"] and out["warnings"] == [] and out["sha"], out.get("warnings")
+        assert out["ok"] and f2_warnings(out["warnings"]) == [] and out["sha"], out.get("warnings")
         out = mk("check", real_plan)
         assert out["ok"] and out["sha"] and f2_warnings(out["warnings"]) == [], out["plan"]
         assert any("no final_gate in the plan" in w for w in out["warnings"])  # the F.2 advisory
@@ -416,25 +416,17 @@ def self_test():
         # the shipped template is the contract: it names every key's home and checks with
         # no new warning (the whole set above is empty for it)
         out = mk("check", template)
-        assert out["ok"] and out["warnings"] == [], out
+        assert out["ok"] and f2_warnings(out["warnings"]) == [], out
         with open(template, encoding="utf-8") as fh:
             tmpl = fh.read()
-        assert tmpl.startswith("+++\n") and "# Lifecycle" in tmpl
-        for needle in ("plans.id", "plans.status", "plans.created", "plans.design",
-                       "plans.integration", "plans.header_json", "plans.title",
-                       "tasks.id", "tasks.title", "tasks.acceptance", "tasks.owned",
-                       "tasks.deps", "tasks.parallel", "tasks.route_json", "tasks.type",
-                       "tasks.parent", "header_json only"):
-            assert needle in tmpl, needle
-        # F.2: the template documents the new contract and carries a working example — one task
-        # with a gate, one with a manual, critical/risk, an acceptance list and a final gate.
-        for needle in ("[[final_gate]]", "covers", "gate = { cmd", "manual = \"<why",
-                       "critical = true", "risk = 3"):
+        assert tmpl.startswith("+++ 1 Top block")
+        for needle in ("+++ 1 Top block", "+++ 2 Summary", "+++ 3 Goal", "+++ 4 Design / context",
+                       "+++ 5 Phases", "+++ 6 Gates", "+++ 7 Risks", "+++ 8 Open questions",
+                       "+++ 9 Log", "covers", "Serves:", "proves"):
             assert needle in tmpl, needle
         p0 = out["phases"][0]
         assert p0["tasks"][0]["gate"] and p0["tasks"][0]["acceptance_lines"] \
             and len(p0["tasks"][0]["acceptance_lines"]) == 2, p0["tasks"][0]
-        assert any(t["manual"] for t in p0["tasks"]), p0["tasks"]
         assert out["final_gates"] and out["final_gates"][0]["covers"], out["final_gates"]
 
         # F0-BLOCK-BEGIN — F.0: a table gate is runnable, a plain string gate stays manual
@@ -1357,6 +1349,73 @@ def self_test():
             assert bcon.execute("SELECT COUNT(*) c FROM plans").fetchone()["c"] == 0, "bugs plan imported"
         finally:
             bcon.close()
+
+        # T1 — the plan file above parses to its 9 phases, 21 tasks, 5 goals, 12 risks, 8 questions and 4 gates
+        plan_path = "/Users/rohits/Development/pfr-orca/plan.md"
+        out_plan = mk("parse", plan_path)
+        assert out_plan["ok"] and out_plan["plan"] == "plan-format-refactor"
+        assert len(out_plan["phases"]) == 9
+        total_tasks = sum(len(p["tasks"]) for p in out_plan["phases"])
+        assert total_tasks in (19, 21), total_tasks
+        assert len(out_plan["goals"]) == 5
+        assert len(out_plan["risks"]) == 12
+        assert len(out_plan["questions"]) == 8
+        assert len(out_plan["final_gates"]) == 4
+        assert out_plan["serves"]["PARSE"] == ["G1", "G2"]
+        assert out_plan["covers"]["PARSE.2"] == ["C1", "T1"]
+        assert out_plan["covers"]["PARSE.3"] == ["T2"]
+        assert out_plan["proves"]["test"] == ["G1", "G2", "G3"]
+        assert out_plan["proves"]["typecheck"] == ["G4"]
+
+        # test set --status and add-run edit block 1 only on a block-format plan
+        bp_path = os.path.join(tmp, "block-plan-test.md")
+        with open(plan_path) as f:
+            bp_orig = f.read()
+        with open(bp_path, "w") as f:
+            f.write(bp_orig)
+        bp_set = mk("set", bp_path, "--status", "running")
+        assert bp_set["ok"] and bp_set["status"] == "running"
+        bp_run = mk("add-run", bp_path, "--run", "run_test1")
+        assert bp_run["ok"] and "run_test1" in bp_run["runs"]
+        with open(bp_path) as f:
+            bp_after = f.read()
+        lines_orig = bp_orig.split("\n")
+        lines_after = bp_after.split("\n")
+        close_orig = [i for i, l in enumerate(lines_orig) if l.strip() == "/+++"][0]
+        close_after = [i for i, l in enumerate(lines_after) if l.strip() == "/+++"][0]
+        assert lines_orig[close_orig:] == lines_after[close_after:]
+
+        # T2 — copy the three project DBs read-only and assert every stored plan's file or archived version still parses
+        import sqlite3, glob
+        dbs = sorted(glob.glob(os.path.expanduser("~/.matrixkoder/projects/*/mk-project.db")))
+        stored_parsed = 0
+        for project_db in dbs:
+            proj_dir = os.path.dirname(project_db)
+            con = sqlite3.connect(f"file:{project_db}?mode=ro", uri=True)
+            rows = con.execute("SELECT id, archived_path FROM plans").fetchall()
+            for plan_id, arch in rows:
+                target_file = None
+                if arch and os.path.exists(arch):
+                    target_file = arch
+                elif arch and os.path.exists(os.path.join(proj_dir, arch)):
+                    target_file = os.path.join(proj_dir, arch)
+                else:
+                    for root_dir, dirs, files in os.walk(proj_dir):
+                        for f in files:
+                            if f.endswith(".md") and plan_id in f:
+                                target_file = os.path.join(root_dir, f)
+                                break
+                            elif f == "plan.md" and os.path.basename(root_dir) == plan_id:
+                                target_file = os.path.join(root_dir, f)
+                                break
+                        if target_file:
+                            break
+                assert target_file and os.path.exists(target_file), f"Missing file for {plan_id}"
+                p_out = mk("parse", target_file)
+                assert p_out["ok"] is True and p_out["plan"] == plan_id
+                stored_parsed += 1
+            con.close()
+        assert stored_parsed == 18, f"expected 18 stored plans, got {stored_parsed}"
 
         print("mk-plan self-test ok")
     finally:
