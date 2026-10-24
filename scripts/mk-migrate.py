@@ -469,7 +469,13 @@ def _header(con, plan_id):
 def _design_refs(con, plan_id):
     """The plan's design/asset references (paths under the checkout). The `design` COLUMN holds
     them from D1.1 on; a store without the column keeps them in `header_json` (C3: the header was
-    their only home). Both shapes are read; the column wins when it carries a value."""
+    their only home). Both shapes are read; the column wins when it carries a value.
+
+    A numbered-block plan has no `design` header key: it names its documents on the Goal block's
+    `Sources:` line (templates/plan.md, block 3). That line is read out of the stored body, and it
+    is used only when neither the column nor the header key named anything, so an old plan keeps
+    the answer it always had. The paths are the line's backticked `...` spans, else its
+    comma-separated items; `none` names nothing."""
     cols = {r["name"] for r in con.execute("PRAGMA table_info(plans)")}
     if "design" in cols:
         row = con.execute("SELECT design FROM plans WHERE id=?", (plan_id,)).fetchone()
@@ -478,9 +484,33 @@ def _design_refs(con, plan_id):
                 got = json.loads(row["design"])
             except ValueError:
                 got = None
-            if isinstance(got, list):
+            if isinstance(got, list) and got:
                 return [x for x in got if isinstance(x, str) and x]
-    return [x for x in (_header(con, plan_id).get("design") or []) if isinstance(x, str) and x]
+    hdr = _header(con, plan_id)
+    old = [x for x in (hdr.get("design") or []) if isinstance(x, str) and x]
+    return old or _sources_refs(hdr.get("body") or "")
+
+
+SOURCES_LINE_RE = re.compile(r"^\s*-\s*Sources\s*:\s*(.*)$", re.M)
+GOAL_BLOCK_RE = re.compile(r"^\+\+\+\s+3\s+Goal\b(.*?)^/\+{3}\s*$", re.M | re.S)
+
+
+def _sources_refs(body):
+    """The paths a Goal block's `- Sources:` line names, or [] when there is no such line.
+    The block is found by its number (3 Goal), so a `Sources:` line quoted elsewhere does not
+    count. `none` and links name no path under the checkout."""
+    m = GOAL_BLOCK_RE.search(body or "")
+    if not m:
+        return []
+    line = SOURCES_LINE_RE.search(m.group(1))
+    if not line:
+        return []
+    text = line.group(1).strip()
+    if not text or text.lower().startswith("none"):
+        return []
+    ticks = re.findall(r"`([^`]+)`", text)
+    cands = ticks or [x.strip() for x in text.split(",")]
+    return [c for c in (c.strip() for c in cands) if c and "://" not in c and " " not in c]
 
 
 def live_plans(con):
@@ -1824,78 +1854,165 @@ def _check(cond, msg):
         raise SystemExit(f"SELF-TEST FAIL: {msg}")
 
 
-SYNTHETIC_PLAN = b"""+++
+SYNTHETIC_PLAN = """+++ 1 Top block — plan identity [toml]
 plan = "fixture"
 status = "running"
 created = 2026-10-14
 runs = ["fixture-r1"]
-design = []
 integration = "main"
+/+++
 
-[[phase]]
++++ 2 Summary
+# fixture — the plan the migrate self-test copies
+
+## Summary
+- Phases: 1 · P1: one phase
+- Method: single lane · subagents off
+- Lanes: P1 (own lane)
+- Delivery: main · pushed: no
+- Gates: test
+/+++
+
++++ 3 Goal
+## Goal
+- Done when:
+  - G1 — the plan's files are copied to the C2 tree
+- Why: the self-test needs a plan file of the shipped shape
+- From: the self-test
+- Sources: none
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1 — one phase
+### P1 — one phase
+- Goal: one task exists
+- Serves: G1
+- Needs first: nothing
+- Build order: P1.1
+- Hazards: none
+- Carries: none
+/+++
+
++++ 5.1.0 P1 settings [toml]
 id = "P1"
 title = "one phase"
 wave = 1
-deps = []
 owned = []
-forbidden = []
-route = ""
-reviewer = ""
-size = "standard"
-risk = "reversible"
-review = "light"
-qa = []
 commit = "feat: p1"
 subagents = false
-lane_group = ""
+/+++
 
-  [[phase.task]]
-  id = "P1.1"
-  title = "one task"
-  acceptance = "it works"
-  subagent = false
-  owned = []
-+++
-"""
++++ 5.1.1 P1.1 — one task [toml]
+id = "P1.1"
+title = "one task"
+acceptance = ["it works"]
+risk = 1
+/+++
+""".encode("utf-8")
 
 
-Z15_PLAN = """+++
+Z15_PLAN = """+++ 1 Top block — plan identity [toml]
 plan = "z15plan"
 status = "draft"
 created = 2026-10-15
 runs = []
-design = ["z15-research.md"]
 integration = "main"
+/+++
 
-[gates]
-test = "true"
++++ 2 Summary
+# z15plan — the live plan of the Z15 case
 
-[[phase]]
+## Summary
+- Phases: 1 — P1: one phase
+- Method: single lane · subagents off
+- Lanes: P1 (own lane)
+- Delivery: main · pushed: no
+- Gates: test
+/+++
+
++++ 3 Goal
+## Goal
+- Done when:
+  - G1 — the plan folder holds plan.md, assets/ and archive/ after the switch
+- Why: the Z15 case runs a live plan through the switch
+- From: the self-test
+- Sources: `z15-research.md`
+/+++
+
++++ 4 Design / context
+## Design / context
+### What is wrong today
+1. none, this is new
+### Shape of the change
+One task; nothing else changes.
+### Contracts
+none
+### Test plan
+T1 — the switch carries the plan folder — integration — `scripts/mk-migrate.py --self-test` — written by P1.1
+### Assumptions and dependencies
+none
+### Rollout and undo
+R1 — ships by merge; undo = revert the merge — P1.1
+### Settings and limits
+S1 — most lanes at once — 3 — mk-config.py list --json — 2026-10-15
+### Out of scope
+Nothing.
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1 — one phase
+### P1 — one phase
+- Goal: one task exists and is done
+- Serves: G1
+- Needs first: nothing
+- Build order: P1.1
+- Hazards: none
+- Carries: T1, R1
+/+++
+
++++ 5.1.0 P1 settings [toml]
 id = "P1"
 title = "one phase"
 wave = 1
-deps = []
 owned = []
-forbidden = []
-route = ""
-reviewer = ""
-size = "standard"
-risk = "reversible"
-review = "light"
-qa = []
 commit = "feat: p1"
 subagents = false
-lane_group = ""
+/+++
 
-  [[phase.task]]
-  id = "P1.1"
-  title = "one task"
-  acceptance = "it works"
-  subagent = false
-  owned = []
-+++
++++ 5.1.1 P1.1 — one task [toml]
+id = "P1.1"
+title = "one task"
+acceptance = ["it works"]
+risk = 2
+/+++
 
-# z15plan — the live plan of the Z15 case
++++ 6 Gates
+## Gates
+- test — proves G1 — the test gate passes
+/+++
+
++++ 6.0 Gate settings [toml]
+use = ["test"]
+/+++
+
++++ 7 Risks
+## Risks
+/+++
+
++++ 8 Open questions
+## Open questions
+/+++
+
++++ 9 Log
+## Log
+- 2026-10-15 — drafted — the live plan of the Z15 case — user
+/+++
 """
 
 
@@ -3324,7 +3441,7 @@ def self_test():
         subprocess.run(["git", "init", "-q", z15b_repo], check=False)
         z15b_plan = os.path.join(z15b_repo, "z15bplan.md")
         with open(z15b_plan, "w") as f:
-            f.write(Z15_PLAN.replace('design = ["z15-research.md"]', "design = []")
+            f.write(Z15_PLAN.replace("- Sources: `z15-research.md`", "- Sources: none")
                     .replace('plan = "z15plan"', 'plan = "z15bplan"'))
         mkdb.open_project(z15b_home, "fixture", data_dir=z15b_data).close()
         _root_rows_set(z15b_home, [("fixture", z15b_data)])

@@ -9,33 +9,36 @@ import { DATA_DIR, mockFs, mockWorld, paneProps, sessionStart, worldFiles, world
 const HOME = '/tmp/mk-inbox-home'
 /** the REAL `mk-inbox.py list --json` reply, captured in a temp home holding
  *  scripts/fixtures/inbox-plan-template.md and scripts/fixtures/inbox-plan-not-a-plan.md (the
- *  two fixture copies; the `warnings` entry is this capture's own and is dropped below). */
+ *  two fixture copies; the `warnings` entry is this capture's own and is dropped below). Both
+ *  fixtures are numbered-block plans, so each count is `n of 9 blocks found` (CONSUM.1). */
 const LIST_REPLY = {
   ok: true,
   files: [
     {
       id: 'mk-ponytail-hooks',
       path: 'notes-2026-10-20.md',
-      title: 'Goal',
+      title: 'mk-ponytail-hooks',
       fit: 'not_a_plan',
-      sections_found: 0,
-      sections_total: 7,
-      missing: ['Summary', 'Goal', 'Design / context', 'Phases', 'Risks', 'Open questions', 'Log', 'header phases', 'tasks', 'acceptance'],
+      sections_found: 5,
+      sections_total: 9,
+      missing: ['Summary', 'Phases', 'Gates', 'Log', 'Design / context', 'header phases', 'tasks', 'acceptance'],
       age_s: 0,
       archived: false,
       note: 'no phase or task headings',
+      blocks: true,
     },
     {
       id: 'plan-inbox-and-parsing',
       path: 'plan-inbox-and-parsing.md',
       title: 'one clean path from a plan document to the project store, with an Inbox tab',
       fit: 'template',
-      sections_found: 7,
-      sections_total: 7,
+      sections_found: 9,
+      sections_total: 9,
       missing: [],
       age_s: 0,
       archived: false,
       note: '',
+      blocks: true,
     },
   ],
   counts: { inbox: 2, template: 1, fix: 1, archived: 0 },
