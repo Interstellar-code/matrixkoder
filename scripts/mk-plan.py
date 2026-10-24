@@ -148,6 +148,8 @@ def split_plan(text):
         raise Fail([f"line {len(lines)}: no closing '+++' for the header"])
     elif first.startswith("+++ "):
         for i in range(1, len(lines)):
+            if lines[i].strip().startswith("+++ "):
+                raise Fail([f"line {i + 1}: '+++ ' header before previous block closed with '/+++'"])
             if lines[i].strip() == "/+++":
                 return lines, i
         raise Fail([f"line {len(lines)}: no closing '/+++' for block 1"])
@@ -347,14 +349,21 @@ def parse_blocks(text):
         st = line.strip()
         m = re.match(r"^\+\+\+\s+([0-9.]+)\s+(.*?)(?:\s+\[toml\])?$", st)
         if m:
-            num, name = m.group(1), m.group(2)
+            num, name = m.group(1), m.group(2).strip()
             is_toml = st.endswith("[toml]")
             start_line = i + 1
             b_lines = []
             i += 1
-            while i < len(lines) and lines[i].strip() != "/+++":
+            while i < len(lines):
+                cur_st = lines[i].strip()
+                if cur_st == "/+++":
+                    break
+                if cur_st.startswith("+++ "):
+                    raise Fail([f"line {i + 1}: '+++ ' header before previous block closed with '/+++'"])
                 b_lines.append(lines[i])
                 i += 1
+            if i >= len(lines):
+                raise Fail([f"line {len(lines)}: missing '/+++' before end of file"])
             close_line = i + 1
             blocks.append({
                 "num": num,
@@ -369,6 +378,35 @@ def parse_blocks(text):
     return blocks
 
 
+def block_by_name(blocks, name):
+    name_norm = name.strip().lower()
+    for b in blocks:
+        b_name = b["name"].strip().lower()
+        if b_name == name_norm:
+            return b
+    for b in blocks:
+        b_name = b["name"].strip().lower()
+        if name_norm == "top block" and b_name.startswith("top block"):
+            return b
+        elif name_norm == "summary" and b_name.startswith("summary"):
+            return b
+        elif name_norm == "goal" and (b_name.startswith("goal") or b_name == "goals"):
+            return b
+        elif name_norm == "design / context" and (b_name.startswith("design") or "design" in b_name):
+            return b
+        elif name_norm == "gate settings" and b_name.startswith("gate settings"):
+            return b
+        elif name_norm == "gates" and (b_name == "gates" or b_name.startswith("gate")) and not b_name.startswith("gate settings"):
+            return b
+        elif name_norm == "risks" and (b_name.startswith("risk") or b_name == "risks"):
+            return b
+        elif name_norm == "open questions" and (b_name.startswith("open question") or b_name == "questions"):
+            return b
+        elif name_norm == "log" and b_name.startswith("log"):
+            return b
+    return None
+
+
 def _parse_toml_block(lines, start_line):
     try:
         clean = "\n".join(l[:-1] if l.endswith("\r") else l for l in lines)
@@ -379,26 +417,36 @@ def _parse_toml_block(lines, start_line):
         raise Fail([f"line {line}: {e}"])
 
 
+def filter_block_lines(lines):
+    in_comment = False
+    for line in lines:
+        st = line.strip()
+        if not st:
+            continue
+        if in_comment:
+            if "-->" in st:
+                in_comment = False
+            continue
+        if "<!--" in st:
+            if "-->" not in st:
+                in_comment = True
+            continue
+        if st.startswith("#"):
+            continue
+        yield line, st
+
+
 def read_block_plan(text, sha=""):
     blocks = parse_blocks(text)
     by_num = {b["num"]: b for b in blocks}
+    warnings = []
 
     # 1. Top block
-    b1 = by_num.get("1")
-    if not b1:
-        for b in blocks:
-            if b["name"].lower().startswith("top block") or b["num"] == "1":
-                b1 = b
-                break
+    b1 = block_by_name(blocks, "Top block")
     top_toml = _parse_toml_block(b1["lines"], b1["start_line"]) if b1 else {}
 
     # 2. Summary
-    b2 = by_num.get("2")
-    if not b2:
-        for b in blocks:
-            if b["name"].lower().startswith("summary") or b["num"] == "2":
-                b2 = b
-                break
+    b2 = block_by_name(blocks, "Summary")
     summary = {"title": "", "phases": "", "method": "", "lanes": "", "delivery": "", "gates": "", "raw": []}
     if b2:
         summary["raw"] = list(b2["lines"])
@@ -411,31 +459,24 @@ def read_block_plan(text, sha=""):
                 summary[m.group(1).lower()] = m.group(2).strip()
 
     # 3. Goal
-    b3 = by_num.get("3")
-    if not b3:
-        for b in blocks:
-            if b["name"].lower().startswith("goal") or b["num"] == "3":
-                b3 = b
-                break
+    b3 = block_by_name(blocks, "Goal")
     goals = []
     goal_meta = {"why": "", "from": "", "sources": "", "raw": []}
     if b3:
         goal_meta["raw"] = list(b3["lines"])
-        for line in b3["lines"]:
+        for line, st in filter_block_lines(b3["lines"]):
             m = re.match(r"^\s*-\s*(G\d+)\s*[—–-]\s*(.*)$", line)
             if m:
                 goals.append({"id": m.group(1), "text": m.group(2).strip(), "raw": line})
-            m2 = re.match(r"^\s*-\s*(Why|From|Sources)\s*:\s*(.*)$", line, re.I)
+                continue
+            m2 = re.match(r"^\s*-\s*(Why|From|Sources|Done when)\s*:\s*(.*)$", line, re.I)
             if m2:
                 goal_meta[m2.group(1).lower()] = m2.group(2).strip()
+                continue
+            warnings.append(f"Goal block: line matches no pattern: {st!r}")
 
     # 4. Design / context
-    b4 = by_num.get("4")
-    if not b4:
-        for b in blocks:
-            if b["name"].lower().startswith("design") or b["num"] == "4":
-                b4 = b
-                break
+    b4 = block_by_name(blocks, "Design / context")
     items = []
     contracts, tests, assumptions, rollout, settings = [], [], [], [], []
     if b4:
@@ -460,24 +501,39 @@ def read_block_plan(text, sha=""):
                     settings.append(entry)
 
     # 6. Gates & 6.0 Gate settings
-    b6 = by_num.get("6")
-    b6_0 = by_num.get("6.0")
+    b6 = block_by_name(blocks, "Gates")
+    b6_0 = block_by_name(blocks, "Gate settings")
     toml_6_0 = _parse_toml_block(b6_0["lines"], b6_0["start_line"]) if b6_0 else {}
     gate_timeout = int(toml_6_0.get("timeout", 600))
     extra_gates = toml_6_0.get("extra", {})
     if not isinstance(extra_gates, dict):
         extra_gates = {}
-    use_gates = as_list(toml_6_0.get("use"))
+    if "use" in toml_6_0:
+        use_names = as_list(toml_6_0.get("use"))
+    else:
+        use_names = ["test", "typecheck"]
+
+    use_gates = [
+        {"id": g, "cmd": None, "use": True, "every": "run_end"}
+        for g in use_names
+    ]
 
     proves_map = {}
-    gate_lines_raw = []
+    gate_lines = []
     if b6:
         for line in b6["lines"]:
-            gate_lines_raw.append(line)
             m = re.match(r"^\s*-\s*(\S+)\s*[—–-]\s*proves\s*(.*?)\s*[—–-]\s*(.*)$", line)
             if m:
                 gname = m.group(1).strip()
-                proves_map[gname] = [p.strip() for p in m.group(2).split(",") if p.strip()]
+                gproves = [p.strip() for p in m.group(2).split(",") if p.strip()]
+                gtext = m.group(3).strip()
+                proves_map[gname] = gproves
+                gate_lines.append({
+                    "name": gname,
+                    "proves": gproves,
+                    "text": gtext,
+                    "raw": line,
+                })
 
     # 5. Phases
     phase_nums = []
@@ -488,6 +544,7 @@ def read_block_plan(text, sha=""):
     phase_nums.sort()
 
     phases = []
+    raw_phases = []
     all_task_ids = []
     covers_map = {}
     serves_map = {}
@@ -498,17 +555,18 @@ def read_block_plan(text, sha=""):
         p_toml = _parse_toml_block(b_p0["lines"], b_p0["start_line"]) if b_p0 else {}
 
         p_goal, p_serves, p_needs, p_build, p_hazards, p_carries = "", [], "", "", [], []
+        p_raw = list(b_p["lines"]) if b_p else []
         if b_p:
             for line in b_p["lines"]:
                 m = re.match(r"^\s*-\s*(Goal|Serves|Needs first|Build order|Hazards|Carries)\s*:\s*(.*)$", line)
                 if m:
                     k, v = m.group(1), m.group(2).strip()
                     if k == "Goal": p_goal = v
-                    elif k == "Serves": p_serves = [x.strip() for x in v.split(",") if x.strip()]
+                    elif k == "Serves": p_serves = [] if v.lower() == "none" else [x.strip() for x in v.split(",") if x.strip() and x.lower() != "none"]
                     elif k == "Needs first": p_needs = v
                     elif k == "Build order": p_build = v
-                    elif k == "Hazards": p_hazards = [x.strip() for x in v.split(",") if x.strip()]
-                    elif k == "Carries": p_carries = [x.strip() for x in v.split(",") if x.strip()]
+                    elif k == "Hazards": p_hazards = [] if v.lower() == "none" else [x.strip() for x in v.split(",") if x.strip() and x.lower() != "none"]
+                    elif k == "Carries": p_carries = [] if v.lower() == "none" else [x.strip() for x in v.split(",") if x.strip() and x.lower() != "none"]
 
         pid = str(p_toml.get("id", ""))
         serves_map[pid] = p_serves
@@ -521,9 +579,11 @@ def read_block_plan(text, sha=""):
         task_nums.sort()
 
         tasks = []
+        raw_tasks = []
         for t_int, t_num in task_nums:
             b_t = by_num.get(t_num)
             t_toml = _parse_toml_block(b_t["lines"], b_t["start_line"]) if b_t else {}
+            raw_tasks.append(dict(t_toml))
             tid = str(t_toml.get("id", ""))
             all_task_ids.append(tid)
 
@@ -600,7 +660,7 @@ def read_block_plan(text, sha=""):
             "route": route_of(p_toml),
             "reviewer": p_toml.get("reviewer", ""),
             "size": p_toml.get("size", "standard"),
-            "subagents": bool(p_toml.get("subagents", False)),
+            "subagents": bool(p_toml["subagents"]) if "subagents" in p_toml else session_subagents(),
             "lane_group": p_toml.get("lane_group", ""),
             "qa": as_list(p_toml.get("qa")),
             "parallel": parallel_of(p_toml),
@@ -611,27 +671,22 @@ def read_block_plan(text, sha=""):
             "hazards": p_hazards,
             "carries": p_carries,
             "tasks": tasks,
+            "raw": p_raw,
         }
         for k, v in p_toml.items():
             if k not in phase_obj and k not in ("risk", "review"):
                 phase_obj[k] = jsonable(v)
         phases.append(phase_obj)
 
-    gate_names = []
-    for g in use_gates:
-        if g not in gate_names:
-            gate_names.append(g)
-    for g in extra_gates.keys():
-        if g not in gate_names:
-            gate_names.append(g)
-    for g in proves_map.keys():
-        if g not in gate_names:
-            gate_names.append(g)
+        raw_phase = dict(p_toml)
+        raw_phase["task"] = raw_tasks
+        raw_phases.append(raw_phase)
 
     final_gates = []
     gates_dict = {}
-    for gname in gate_names:
-        cmd = extra_gates.get(gname)
+    for gname in use_names:
+        gates_dict[gname] = gname
+    for gname, cmd in extra_gates.items():
         final_gates.append({
             "id": gname,
             "cmd": cmd,
@@ -642,14 +697,14 @@ def read_block_plan(text, sha=""):
             "covers": list(all_task_ids),
             "proves": proves_map.get(gname, []),
         })
-        gates_dict[gname] = {"cmd": cmd, "expect": 0, "timeout": gate_timeout} if cmd else gname
+        gates_dict[gname] = {"cmd": cmd, "expect": 0, "timeout": gate_timeout}
 
     # 7. Risks
-    b7 = by_num.get("7")
+    b7 = block_by_name(blocks, "Risks")
     risks = []
     if b7:
-        for line in b7["lines"]:
-            m = re.match(r"^\s*-\s*(K\d+)\s*[—–-]\s*(.*?)\s*[—–-]\s*level\s*(\S+)\s*[—–-]\s*guard:\s*(.*?)\s*[—–-]\s*(\S+)\s*$", line)
+        for line, st in filter_block_lines(b7["lines"]):
+            m = re.match(r"^\s*-\s*(K\d+)\s*[—–-]\s*(.*?)\s*[—–-]\s*level\s*(\S+)\s*[—–-]\s*guard:\s*(.*?)\s*[—–-]\s*(.*?)\s*$", line)
             if m:
                 risks.append({
                     "id": m.group(1),
@@ -659,25 +714,31 @@ def read_block_plan(text, sha=""):
                     "target": m.group(5).strip(),
                     "raw": line
                 })
+                continue
+            warnings.append(f"Risks block: line matches no pattern: {st!r}")
 
     # 8. Open questions
-    b8 = by_num.get("8")
+    b8 = block_by_name(blocks, "Open questions")
     questions = []
     if b8:
-        for line in b8["lines"]:
-            m = re.match(r"^\s*-\s*\[([ xX])\]\s*(Q\d+)\s*[—–-]\s*(.*?)\s*[—–-]\s*blocks:\s*(\S+)\s*[—–-]\s*pick:\s*(.*)$", line)
+        for line, st in filter_block_lines(b8["lines"]):
+            m = re.match(r"^\s*-\s*\[([ xX])\]\s*(Q\d+)\s*[—–-]\s*(.*?)\s*[—–-]\s*blocks:\s*(.*?)\s*[—–-]\s*pick:\s*(.*)$", line)
             if m:
+                raw_blocks = m.group(4).strip()
+                q_blocks = [] if raw_blocks.lower() == "none" else [b.strip() for b in raw_blocks.split(",") if b.strip() and b.lower() != "none"]
                 questions.append({
                     "id": m.group(2),
                     "ticked": m.group(1).lower() == "x",
                     "question": m.group(3).strip(),
-                    "blocks": m.group(4).strip(),
+                    "blocks": q_blocks,
                     "pick": m.group(5).strip(),
                     "raw": line
                 })
+                continue
+            warnings.append(f"Open questions block: line matches no pattern: {st!r}")
 
     # 9. Log
-    b9 = by_num.get("9")
+    b9 = block_by_name(blocks, "Log")
     log = []
     if b9:
         for line in b9["lines"]:
@@ -702,7 +763,9 @@ def read_block_plan(text, sha=""):
         "pushed": bool(top_toml.get("pushed", False)),
         "reviewer": str(top_toml.get("reviewer", "")),
         "gates": gates_dict,
+        "use_gates": use_gates,
         "final_gates": final_gates,
+        "gate_lines": gate_lines,
         "phases": phases,
         "goals": goals,
         "goal_meta": goal_meta,
@@ -719,19 +782,17 @@ def read_block_plan(text, sha=""):
         "serves": serves_map,
         "covers": covers_map,
         "proves": proves_map,
+        "warnings": warnings,
     }
     for k, v in top_toml.items():
         if k not in out:
             out[k] = jsonable(v)
 
     header = dict(top_toml)
-    header["phase"] = []
-    for p in phases:
-        ph_dict = dict(p)
-        ph_dict["task"] = [dict(t) for t in p["tasks"]]
-        header["phase"].append(ph_dict)
+    header["phase"] = raw_phases
     header["gates"] = gates_dict
     header["final_gate"] = final_gates
+    header["use_gates"] = use_gates
 
     return header, out, sha
 
@@ -859,9 +920,12 @@ def header_parts(out):
     Phases body section."""
     phases = out["phases"]
     tasks = [t for p in phases for t in p["tasks"]]
+    fg_ok = any(isinstance(g, dict) and g.get("covers") for g in out.get("final_gates") or [])
+    if out.get("block_format") and not fg_ok:
+        fg_ok = bool(out.get("use_gates")) or bool(out.get("final_gates"))
     return {"header phases": bool(phases), "tasks": bool(tasks),
             "acceptance": bool(tasks) and all(t["acceptance_lines"] for t in tasks),
-            "final gate": any(isinstance(g, dict) and g.get("covers") for g in out.get("final_gates") or [])}
+            "final gate": fg_ok}
 
 
 def classify(out, body):
@@ -935,7 +999,7 @@ def check_plan(header, out, body=None):
     advisory (cross-run deps, malformed id shapes) is a warning. `body` is the markdown
     below the closing +++ when the caller has it: the T1 header-key gaps are warnings
     there too, so a plan written before the key existed still checks ok."""
-    errors, warnings = [], []
+    errors, warnings = [], list(out.get("warnings") or [])
     phases = out["phases"]
     raw = as_list(header.get("phase"))
 
@@ -1028,16 +1092,12 @@ def check_plan(header, out, body=None):
                     errors.append(f"{pid}: dep {d} is in a later wave ({by_id[d]['wave']} > {p['wave']})")
             else:
                 errors.append(f"{pid}: unknown dep {d}")
-        if not out.get("block_format"):
-            if p["size"] not in SIZES:
-                errors.append(f"{pid}: bad size {p['size']!r} ({'|'.join(SIZES)})")
-            if p["risk"] not in RISKS:
-                errors.append(f"{pid}: bad risk {p['risk']!r} ({'|'.join(RISKS)})")
-            if p["review"] not in REVIEWS:
-                errors.append(f"{pid}: bad review {p['review']!r} ({'|'.join(REVIEWS)})")
-        else:
-            if p.get("size") and p["size"] not in SIZES:
-                errors.append(f"{pid}: bad size {p['size']!r} ({'|'.join(SIZES)})")
+        if p["size"] not in SIZES:
+            errors.append(f"{pid}: bad size {p['size']!r} ({'|'.join(SIZES)})")
+        if "risk" in p and p["risk"] not in RISKS:
+            errors.append(f"{pid}: bad risk {p['risk']!r} ({'|'.join(RISKS)})")
+        if "review" in p and p["review"] not in REVIEWS:
+            errors.append(f"{pid}: bad review {p['review']!r} ({'|'.join(REVIEWS)})")
         if p["route"] != "" and not ROUTE_RE.fullmatch(str(p["route"])):
             errors.append(f'{pid}: bad route {p["route"]!r} ("" or "<agent> <model> [<effort>]")')
         if not isinstance(p["reviewer"], str):
@@ -1147,10 +1207,7 @@ def check_gate_fields(out, errors, warnings):
         if gates and manual:
             errors.append(f"{rid}: gate and manual are exclusive; pick one")
         elif not gates and not manual:
-            if not out.get("block_format"):
-                warnings.append(f"{rid}: neither gate nor manual line")
-            elif t.get("subtasks") is not None and t.get("risk", 1) >= 3:
-                warnings.append(f"{rid}: neither gate nor manual line")
+            warnings.append(f"{rid}: neither gate nor manual line")
         lines = {ln["id"] for ln in t.get("acceptance_lines") or []}
         for i, g in enumerate(gates):
             glabel = f"{tid} gate" if len(gates) == 1 else f"{rid} gate {i + 1}"
@@ -1185,8 +1242,7 @@ def check_gate_fields(out, errors, warnings):
             continue
         label = f"final gate {final_gate_id(g, i)}"
         if not isinstance(g.get("cmd"), str) or not g["cmd"].strip():
-            if not (out.get("block_format") and g.get("cmd") is None):
-                errors.append(f"{label}: needs cmd (a non-empty string)")
+            errors.append(f"{label}: needs cmd (a non-empty string)")
         if type(g.get("expect")) is not int:
             errors.append(f"{label}: expect must be an int, not {g.get('expect')!r}")
         if type(g.get("timeout")) is not int:
@@ -1200,7 +1256,8 @@ def check_gate_fields(out, errors, warnings):
             if str(cid) not in task_ids:
                 errors.append(f"{label}: covers {cid!r} is not a task in this plan")
     if not finals:
-        warnings.append("no final_gate in the plan: F.2 wants one plan-level gate with covers")
+        if not (out.get("block_format") and (out.get("use_gates") or out.get("final_gates"))):
+            warnings.append("no final_gate in the plan: F.2 wants one plan-level gate with covers")
 
 
 # ---------- set / add-run (P1.3): rewrite only the key's line(s) ----------

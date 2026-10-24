@@ -427,7 +427,9 @@ def self_test():
         p0 = out["phases"][0]
         assert p0["tasks"][0]["gate"] and p0["tasks"][0]["acceptance_lines"] \
             and len(p0["tasks"][0]["acceptance_lines"]) == 2, p0["tasks"][0]
-        assert out["final_gates"] and out["final_gates"][0]["covers"], out["final_gates"]
+        assert out.get("use_gates") or (out.get("final_gates") and out["final_gates"][0]["covers"]), out
+        if out.get("use_gates"):
+            assert [g["id"] for g in out["use_gates"]] == ["test", "typecheck"]
 
         # F0-BLOCK-BEGIN — F.0: a table gate is runnable, a plain string gate stays manual
         p = write("gate-table.md", plan_text(head_extra=(
@@ -1350,22 +1352,79 @@ def self_test():
         finally:
             bcon.close()
 
-        # T1 — the plan file above parses to its 9 phases, 21 tasks, 5 goals, 12 risks, 8 questions and 4 gates
-        plan_path = "/Users/rohits/Development/pfr-orca/plan.md"
+        # T1 — the plan file above parses to its 9 phases, 19 tasks, 5 goals, 12 risks, 8 questions and 2 final gates
+        plan_path = os.path.join(root, "scripts", "fixtures", "plan-blocks.md")
         out_plan = mk("parse", plan_path)
         assert out_plan["ok"] and out_plan["plan"] == "plan-format-refactor"
         assert len(out_plan["phases"]) == 9
         total_tasks = sum(len(p["tasks"]) for p in out_plan["phases"])
-        assert total_tasks in (19, 21), total_tasks
+        assert total_tasks == 19, total_tasks
+        expected_task_ids = [
+            ["PARSE.1", "PARSE.2", "PARSE.3"],
+            ["GATEKEY.1", "GATEKEY.2"],
+            ["CHECK.1", "CHECK.2", "CHECK.3"],
+            ["STORE.1", "STORE.2", "STORE.3"],
+            ["CONSUM.1", "CONSUM.2"],
+            ["TSFIX.1"],
+            ["RUN.1", "RUN.2"],
+            ["TSNEW.1"],
+            ["DOCS.1", "DOCS.2"],
+        ]
+        assert [[t["id"] for t in p["tasks"]] for p in out_plan["phases"]] == expected_task_ids
         assert len(out_plan["goals"]) == 5
         assert len(out_plan["risks"]) == 12
         assert len(out_plan["questions"]) == 8
-        assert len(out_plan["final_gates"]) == 4
+        assert len(out_plan["final_gates"]) == 2
+        assert len(out_plan["use_gates"]) == 2
         assert out_plan["serves"]["PARSE"] == ["G1", "G2"]
         assert out_plan["covers"]["PARSE.2"] == ["C1", "T1"]
         assert out_plan["covers"]["PARSE.3"] == ["T2"]
         assert out_plan["proves"]["test"] == ["G1", "G2", "G3"]
         assert out_plan["proves"]["typecheck"] == ["G4"]
+
+        # MEDIUM 6: add a case with a 5.n.m.k subtask
+        sub_plan_text = """+++ 1 Top block [toml]
+plan = "sub-plan"
+status = "draft"
+created = "2026-10-24"
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1
+- Goal: P1
+/+++
+
++++ 5.1.0 P1 settings [toml]
+id = "P1"
+title = "Phase 1"
+wave = 1
+owned = ["a.py"]
+commit = "feat: p1"
+/+++
+
++++ 5.1.1 P1.1 task [toml]
+id = "P1.1"
+title = "Task 1"
+acceptance = "acc1"
+/+++
+
++++ 5.1.1.1 P1.1.1 subtask [toml]
+id = "P1.1.1"
+title = "Subtask 1"
+acceptance = "subacc1"
+/+++
+"""
+        sub_p = write("subtask-test.md", sub_plan_text)
+        out_sub = mk("parse", sub_p)
+        assert out_sub["ok"]
+        p0_t0 = out_sub["phases"][0]["tasks"][0]
+        assert len(p0_t0["subtasks"]) == 1
+        assert p0_t0["subtasks"][0]["id"] == "P1.1.1"
+        assert p0_t0["subtasks"][0]["title"] == "Subtask 1"
+        assert p0_t0["subtasks"][0]["acceptance"] == "subacc1"
 
         # test set --status and add-run edit block 1 only on a block-format plan
         bp_path = os.path.join(tmp, "block-plan-test.md")
@@ -1385,37 +1444,433 @@ def self_test():
         close_after = [i for i, l in enumerate(lines_after) if l.strip() == "/+++"][0]
         assert lines_orig[close_orig:] == lines_after[close_after:]
 
+        # Test HIGH 1: final_gates only from 6.0 [extra], use_gates carries use gates with cmd=None, legend names not added
+        bp_g = write("test-high1.md", """+++ 1 Top block [toml]
+plan = "high1"
+status = "draft"
+created = "2026-10-24"
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1
+- Goal: P1
+/+++
+
++++ 5.1.0 P1 settings [toml]
+id = "P1"
+title = "P1"
+wave = 1
+owned = ["a.py"]
+commit = "feat: p1"
+/+++
+
++++ 5.1.1 P1.1 task [toml]
+id = "P1.1"
+title = "T1"
+acceptance = "a1"
+/+++
+
++++ 6 Gates
+## Gates
+- legend_only — proves G1 — legend gate description
+- test — proves G1 — test proves
+/+++
+
++++ 6.0 Gate settings [toml]
+use = ["test"]
+timeout = 300
+[extra]
+custom_gate = "echo custom"
+/+++
+""")
+        out_g = mk("parse", bp_g)
+        assert out_g["ok"]
+        assert "use_gates" in out_g, "use_gates key must exist"
+        assert out_g["use_gates"] == [{"id": "test", "cmd": None, "use": True, "every": "run_end"}]
+        assert [g["id"] for g in out_g["final_gates"]] == ["custom_gate"]
+        assert out_g["final_gates"][0]["cmd"] == "echo custom"
+        assert not any(g["id"] == "legend_only" for g in out_g["final_gates"])
+        assert not any(g["id"] == "legend_only" for g in out_g["use_gates"])
+        chk_g = mk("check", bp_g)
+        assert chk_g["ok"] is True, chk_g
+
+        # Test HIGH 2: header passed to check_plan built from raw toml, so missing wave or commit is an error
+        bp_no_wave = write("test-high2-wave.md", """+++ 1 Top block [toml]
+plan = "high2-wave"
+status = "draft"
+created = "2026-10-24"
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1
+- Goal: P1
+/+++
+
++++ 5.1.0 P1 settings [toml]
+id = "P1"
+title = "P1"
+owned = ["a.py"]
+commit = "feat: p1"
+/+++
+
++++ 5.1.1 P1.1 task [toml]
+id = "P1.1"
+title = "T1"
+acceptance = "a1"
+/+++
+""")
+        out_no_wave = mk("check", bp_no_wave, code=2)
+        assert out_no_wave["ok"] is False
+        assert any("no wave key" in e for e in out_no_wave["errors"]), out_no_wave
+
+        bp_no_commit = write("test-high2-commit.md", """+++ 1 Top block [toml]
+plan = "high2-commit"
+status = "draft"
+created = "2026-10-24"
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1
+- Goal: P1
+/+++
+
++++ 5.1.0 P1 settings [toml]
+id = "P1"
+title = "P1"
+wave = 1
+owned = ["a.py"]
+/+++
+
++++ 5.1.1 P1.1 task [toml]
+id = "P1.1"
+title = "T1"
+acceptance = "a1"
+/+++
+""")
+        out_no_commit = mk("check", bp_no_commit, code=2)
+        assert out_no_commit["ok"] is False
+        assert any("no commit key" in e for e in out_no_commit["errors"]), out_no_commit
+
+        # Test MEDIUM 3: blocks looked up by name, not numbers (numbers order/nest 5.x blocks)
+        bp_renum = write("test-med3.md", """+++ 10 Top block [toml]
+plan = "med3-renum"
+status = "draft"
+created = "2026-10-24"
+/+++
+
++++ 20 Summary
+# med3 title
+- Phases: 1
+/+++
+
++++ 30 Goal
+## Goal
+- G1 — goal one
+/+++
+
++++ 40 Design / context
+C1 — contract one
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1
+- Goal: P1
+/+++
+
++++ 5.1.0 P1 settings [toml]
+id = "P1"
+title = "P1"
+wave = 1
+owned = ["a.py"]
+commit = "feat: p1"
+/+++
+
++++ 5.1.1 P1.1 task [toml]
+id = "P1.1"
+title = "T1"
+acceptance = "a1"
+/+++
+
++++ 60 Gates
+## Gates
+- test — proves G1 — test
+/+++
+
++++ 60.0 Gate settings [toml]
+use = ["test"]
+/+++
+
++++ 70 Risks
+## Risks
+- K1 — risk one — level 2 — guard: test — P1.1
+/+++
+
++++ 80 Open questions
+## Open questions
+- [ ] Q1 — question one — blocks: none — pick: yes
+/+++
+
++++ 90 Log
+- 2026-10-24 — drafted — log one — user
+/+++
+""")
+        out_renum = mk("parse", bp_renum)
+        assert out_renum["ok"] is True
+        assert len(out_renum["goals"]) == 1 and out_renum["goals"][0]["id"] == "G1"
+        assert len(out_renum["items"]) == 1 and out_renum["items"][0]["id"] == "C1"
+        assert len(out_renum["risks"]) == 1 and out_renum["risks"][0]["id"] == "K1"
+        assert len(out_renum["questions"]) == 1 and out_renum["questions"][0]["id"] == "Q1"
+        assert len(out_renum["log"]) == 1 and out_renum["log"][0]["kind"] == "drafted"
+
+        # Test MEDIUM 4: a +++ header before previous /+++, or missing /+++ at EOF, is an error naming line number
+        bp_unclosed = write("test-med4-unclosed.md", """+++ 1 Top block [toml]
+plan = "unclosed"
++++ 2 Summary
+# title
+/+++
+""")
+        out_unclosed = mk("parse", bp_unclosed, code=2)
+        assert out_unclosed["ok"] is False
+        assert any("line 3:" in e for e in out_unclosed["errors"]), out_unclosed
+
+        bp_eof = write("test-med4-eof.md", """+++ 1 Top block [toml]
+plan = "eof"
+status = "draft"
+""")
+        out_eof = mk("parse", bp_eof, code=2)
+        assert out_eof["ok"] is False
+        assert any("line 4:" in e for e in out_eof["errors"]), out_eof
+
+        # Test MEDIUM 5: phase without subagents uses session_subagents(), not False
+        bp_nosub = write("test-med5.md", """+++ 1 Top block [toml]
+plan = "med5"
+status = "draft"
+created = "2026-10-24"
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1
+- Goal: P1
+/+++
+
++++ 5.1.0 P1 settings [toml]
+id = "P1"
+title = "P1"
+wave = 1
+owned = ["a.py"]
+commit = "feat: p1"
+/+++
+
++++ 5.1.1 P1.1 task [toml]
+id = "P1.1"
+title = "T1"
+acceptance = "a1"
+/+++
+""")
+        out_nosub = mk("parse", bp_nosub)
+        assert out_nosub["phases"][0]["subagents"] is True
+
+        # Test LOW 8: new-format equivalents for dropped/loosened asserts (task gate string -> C1 table, risk value)
+        bp_low8 = write("test-low8.md", """+++ 1 Top block [toml]
+plan = "low8"
+status = "draft"
+created = "2026-10-24"
+/+++
+
++++ 4 Design / context
+## Design / context
+C1 — Contract for low8
+T1 — Test for low8
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1
+- Goal: P1
+/+++
+
++++ 5.1.0 P1 settings [toml]
+id = "P1"
+title = "P1"
+wave = 1
+owned = ["a.py"]
+commit = "feat: p1"
+/+++
+
++++ 5.1.1 P1.1 task [toml]
+id = "P1.1"
+title = "T1"
+acceptance = "a1"
+gate = "echo test-gate"
+risk = 3
+/+++
+""")
+        out_low8 = mk("parse", bp_low8)
+        assert len(out_low8["contracts"]) == 1 and out_low8["contracts"][0]["id"] == "C1"
+        assert len(out_low8["tests"]) == 1 and out_low8["tests"][0]["id"] == "T1"
+        t0 = out_low8["phases"][0]["tasks"][0]
+        # task gate string -> C1 table equivalent
+        assert t0["gate"] == [{"cmd": "echo test-gate", "expect": 0, "timeout": 600, "lines": []}]
+        # risk value equivalent
+        assert t0["risk"] == 3
+
+        # Test LOW 9: task with no gate and no manual warns 'neither gate nor manual line' regardless of risk level
+        bp_low9 = write("test-low9.md", """+++ 1 Top block [toml]
+plan = "low9"
+status = "draft"
+created = "2026-10-24"
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1
+- Goal: P1
+/+++
+
++++ 5.1.0 P1 settings [toml]
+id = "P1"
+title = "P1"
+wave = 1
+owned = ["a.py"]
+commit = "feat: p1"
+/+++
+
++++ 5.1.1 P1.1 task [toml]
+id = "P1.1"
+title = "T1"
+acceptance = "a1"
+risk = 1
+/+++
+""")
+        out_low9 = mk("check", bp_low9)
+        assert any("neither gate nor manual line" in w for w in out_low9["warnings"]), out_low9["warnings"]
+
+        # Test LOW 10: none in Hazards/Carries/blocks -> []; gate_lines key; phase raw text; warn on patternless lines
+        bp_low10 = write("test-low10.md", """+++ 1 Top block [toml]
+plan = "low10"
+status = "draft"
+created = "2026-10-24"
+/+++
+
++++ 3 Goal
+## Goal
+- G1 — goal
+This is an unparseable goal line!
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1
+- Goal: P1
+- Hazards: none
+- Carries: none
+/+++
+
++++ 5.1.0 P1 settings [toml]
+id = "P1"
+title = "P1"
+wave = 1
+owned = ["a.py"]
+commit = "feat: p1"
+/+++
+
++++ 5.1.1 P1.1 task [toml]
+id = "P1.1"
+title = "T1"
+acceptance = "a1"
+/+++
+
++++ 6 Gates
+## Gates
+- g1 — proves G1 — line for g1
+/+++
+
++++ 7 Risks
+## Risks
+- K1 — risk — level 1 — guard: g — P1.1
+This is an unparseable risk line!
+/+++
+
++++ 8 Open questions
+## Open questions
+- [ ] Q1 — question — blocks: none — pick: a
+This is an unparseable question line!
+/+++
+""")
+        out_low10 = mk("parse", bp_low10)
+        p1 = out_low10["phases"][0]
+        assert p1["hazards"] == [], p1["hazards"]
+        assert p1["carries"] == [], p1["carries"]
+        assert "raw" in p1 and len(p1["raw"]) > 0
+        q1 = out_low10["questions"][0]
+        assert q1["blocks"] == [], q1["blocks"]
+        assert "gate_lines" in out_low10
+        assert out_low10["gate_lines"][0] == {"name": "g1", "proves": ["G1"], "text": "line for g1", "raw": "- g1 — proves G1 — line for g1"}
+        warns = out_low10["warnings"]
+        assert any("Goal block" in w and "unparseable goal line" in w for w in warns), warns
+        assert any("Risks block" in w and "unparseable risk line" in w for w in warns), warns
+        assert any("Open questions block" in w and "unparseable question line" in w for w in warns), warns
+
         # T2 — copy the three project DBs read-only and assert every stored plan's file or archived version still parses
         import sqlite3, glob
         dbs = sorted(glob.glob(os.path.expanduser("~/.matrixkoder/projects/*/mk-project.db")))
-        stored_parsed = 0
-        for project_db in dbs:
-            proj_dir = os.path.dirname(project_db)
-            con = sqlite3.connect(f"file:{project_db}?mode=ro", uri=True)
-            rows = con.execute("SELECT id, archived_path FROM plans").fetchall()
-            for plan_id, arch in rows:
-                target_file = None
-                if arch and os.path.exists(arch):
-                    target_file = arch
-                elif arch and os.path.exists(os.path.join(proj_dir, arch)):
-                    target_file = os.path.join(proj_dir, arch)
-                else:
-                    for root_dir, dirs, files in os.walk(proj_dir):
-                        for f in files:
-                            if f.endswith(".md") and plan_id in f:
-                                target_file = os.path.join(root_dir, f)
-                                break
-                            elif f == "plan.md" and os.path.basename(root_dir) == plan_id:
-                                target_file = os.path.join(root_dir, f)
-                                break
+        if not dbs:
+            print("note: no project DB exists, skipping T2")
+        else:
+            main_py = os.path.join(os.path.dirname(MK_PLAN_PY), ".tmp-main-mk-plan.py")
+            try:
+                with open(main_py, "wb") as f:
+                    subprocess.check_call(["git", "show", "main:scripts/mk-plan.py"], stdout=f)
+                total_stored = 0
+                stored_parsed = 0
+                for project_db in dbs:
+                    proj_dir = os.path.dirname(project_db)
+                    con = sqlite3.connect(f"file:{project_db}?mode=ro", uri=True)
+                    rows = con.execute("SELECT id, archived_path, header_json FROM plans").fetchall()
+                    total_stored += len(rows)
+                    for plan_id, arch, hdr_json in rows:
+                        target_file = None
+                        if arch and os.path.exists(arch):
+                            target_file = arch
+                        elif arch and os.path.exists(os.path.join(proj_dir, arch)):
+                            target_file = os.path.join(proj_dir, arch)
                         if target_file:
-                            break
-                assert target_file and os.path.exists(target_file), f"Missing file for {plan_id}"
-                p_out = mk("parse", target_file)
-                assert p_out["ok"] is True and p_out["plan"] == plan_id
-                stored_parsed += 1
-            con.close()
-        assert stored_parsed == 18, f"expected 18 stored plans, got {stored_parsed}"
+                            p_out = mk("parse", target_file)
+                            assert p_out["ok"] is True and p_out["plan"] == plan_id
+                            # compare with main's parse output
+                            out_main = subprocess.check_output([sys.executable, main_py, "parse", target_file])
+                            parsed_main = json.loads(out_main)
+                            assert p_out == parsed_main, f"parse mismatch with main for {plan_id}"
+                        else:
+                            hdr = json.loads(hdr_json)
+                            assert "phases" in hdr
+                        stored_parsed += 1
+                    con.close()
+                assert stored_parsed == total_stored, f"expected {total_stored} stored plans, got {stored_parsed}"
+            finally:
+                if os.path.exists(main_py):
+                    os.remove(main_py)
 
         print("mk-plan self-test ok")
     finally:
