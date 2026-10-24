@@ -728,9 +728,8 @@ test('F.8: a rework status maps to NEEDS YOU via the map, and its card lands in 
 
 // the whole F.8 fixture: a shield of seven cards — five risk warriors in
 // rank order (R1..R5), one card with no risk keys at all and one card whose
-// risk is out of range (7 > 5; the mapper drops it, never a made-up badge)
-// — then, off the wall, one critical card. Plain `building` rows: the
-// builder column is the badge's home ground.
+// risk is out of range (7 > 5; the mapper drops it, never a made-up badge).
+// Plain `building` rows: the builder column is the badge's home ground.
 const shieldView = (): PlanKanbanView => planKanbanView({
   ok: true, id: 'shield', phases: [{ id: 'S', tasks: [
     { id: 'X.none', title: 'shield plain', status: 'building' },
@@ -740,7 +739,7 @@ const shieldView = (): PlanKanbanView => planKanbanView({
     { id: 'X.R3', title: 'rank three', status: 'building', risk: 3 },
     { id: 'X.R4', title: 'rank four', status: 'building', risk: 4 },
     { id: 'X.R5', title: 'rank five', status: 'building', risk: 5 },
-    { id: 'X.R9', title: 'shield breach', status: 'building', risk: 4, critical: true },
+    { id: 'X.R9', title: 'shield breach', status: 'building', risk: 4, critical: true }, // critical is a removed field
   ] }],
 })
 
@@ -755,11 +754,11 @@ test('F.8: a card carries the risk the raw row gave it — 1..5 kept, 7 dropped 
     ['X.R3', 3],
     ['X.R4', 4],
     ['X.R5', 5],
-    ['X.R9', 4],           // the critical card's own rank
+    ['X.R9', 4],           // the breach card's own rank
   ]))
 })
 
-test('F.8: the R1..R5 badges draw through the narrow 36-col stack; the critical card adds !!, no one else does', () => {
+test('F.8: the R1..R5 badges draw through the narrow 36-col stack, and no card draws a critical marker', () => {
   // 36 cols is the stacked fallback (planKanbanSideBySide false): the badge
   // is one Text in the card Box, so it survives the narrow stack
   expect(planKanbanSideBySide(36)).toBe(false)
@@ -772,17 +771,12 @@ test('F.8: the R1..R5 badges draw through the narrow 36-col stack; the critical 
   expect(text(narrow)).not.toContain(' R0 ')
   expect(text(narrow)).not.toContain(' R7 ')
 
-  // the critical row: `!!` right by its R4 badge — and no non-critical card
-  // ever draws the marker
+  // `!!` is a removed field: no card draws it, not even one whose raw row carries critical
   const wide = PlanKanbanTab(stubEls(), shieldView(), W80, uiOf().handle)
-  const critCard = cardBox(wide, 'X.R9')
-  expect(critCard, 'the critical shield card is drawn').toBeDefined()
-  expect(text(critCard as N), 'the critical card draws !! by its badge').toContain('!!')
-  for (const tag of ['R1', 'R2', 'R3', 'R4', 'R5']) {
-    const tagCard = cardBox(wide, `X.${tag}`)
-    expect(text(tagCard as N), `${tag} is not critical → no !! marker`).not.toContain('!!')
+  expect(cardBox(wide, 'X.R9'), 'the breach card is drawn').toBeDefined()
+  for (const id of ['X.none', 'X.bad', 'X.R1', 'X.R2', 'X.R3', 'X.R4', 'X.R5', 'X.R9']) {
+    expect(text(cardBox(wide, id) as N), `${id} draws no !! marker`).not.toContain('!!')
   }
-  expect(text(cardBox(wide, 'X.none') as N), 'the absent-risk card shows no !! either').not.toContain('!!')
 })
 
 
@@ -802,7 +796,7 @@ test('F.8: a row without the risk keys renders byte-identically even when a sibl
     ok: true, id: 'byteguard',
     phases: [{ id: 'P1', tasks: [
       { id: 'P1.1', title: 'first, untouched', status: 'building' },
-      { id: 'P1.2', title: 'second, untouched', status: 'planned', risk: 2, critical: false },
+      { id: 'P1.2', title: 'second, untouched', status: 'planned', risk: 2 },
     ] }],
   })
   const plainTree = PlanKanbanTab(stubEls(), bare, W80, uiOf().handle)

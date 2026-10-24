@@ -21,7 +21,7 @@ const LIST_REPLY = {
       fit: 'not_a_plan',
       sections_found: 5,
       sections_total: 9,
-      missing: ['Summary', 'Phases', 'Gates', 'Log', 'Design / context', 'header phases', 'tasks', 'acceptance'],
+      missing: ['Summary', 'Phases', 'Gates', 'Log', 'header phases', 'tasks', 'acceptance'],
       age_s: 0,
       archived: false,
       note: 'no phase or task headings',
@@ -235,6 +235,8 @@ test('WIRE.1.a2: the list runs once on open, not while the tab is closed, then o
   expect(await ui.find(HEAD)).toBeTruthy()
   expect(await ui.find({ text: /plan-inbox-and-parsing\.md/ }), 'the template card').toBeTruthy()
   expect(await ui.find({ text: /notes-2026-10-20\.md/ }), 'the not-a-plan card').toBeTruthy()
+  // TSFIX: the card reads its noun from the reply's `blocks` flag (9 of 9 blocks, not sections)
+  expect(await ui.find({ text: /9 of 9 blocks found/ }), 'the count says blocks').toBeTruthy()
   expect(await ui.find({ text: 'MOCK · fixture data · not this run' }), 'never the fixture').toBeUndefined()
   await w.clock.advance(5000)
   await w.settle()
@@ -429,6 +431,19 @@ test('WIRE.1.a3: Open on an archived card addresses the file under inbox/archive
   await ui.press({ key: 'inbox-open-plan-inbox-and-parsing' })
   await w.settle()
   expect(openers).toEqual([['open', '--', `${HOME}/inbox/archive/plan-inbox-and-parsing.md`]])
+})
+
+test('TSFIX.1: a reply row without a `blocks` flag keeps the sections noun (and a true one reads blocks)', { plugins: [worldFixtures] }, async ($, on) => {
+  // an old reply carries no `blocks`: the card must not call seven sections nine blocks
+  const old = { ok: true, files: [{ ...LIST_REPLY.files[1], blocks: undefined, sections_found: 5, sections_total: 7, missing: [] }], counts: { inbox: 1, template: 1, fix: 0, archived: 0 } }
+  const w = await world(on, { listReply: old })
+  await $.session.start(sessionStart())
+  await w.settle()
+  const ui = await mount($)
+  await ui.press({ key: 'dash-tab-inbox' })
+  await w.settle()
+  expect(await ui.find({ text: /5 of 7 sections found/ }), 'the sections noun').toBeTruthy()
+  expect(await ui.find({ text: /blocks found/ }), 'never the blocks noun').toBeUndefined()
 })
 
 test('WIRE.1.a3: an Open whose openers both refuse draws the card’s failed state', { plugins: [worldFixtures] }, async ($, on) => {
