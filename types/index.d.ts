@@ -26,10 +26,9 @@ export type MkTask = {
   last_commit?: string | null
   round?: number
   updated?: string | null
-  /** F.1 contract: the derived risk (int 1-5), its critical flag and the open
-   *  reasons (each {kind, points, source, opened}). Optional — an old row has none. */
+  /** F.1 contract: the derived risk (int 1-5) and the open reasons (each
+   *  {kind, points, source, opened}). Optional — an old row has none. */
   risk?: number
-  critical?: boolean
   open_reasons?: readonly { readonly kind: string; readonly points: number; readonly source: string; readonly opened: string }[]
 }
 
@@ -116,7 +115,7 @@ export type MkStatusMemory = {
 }
 
 /** dashboard.tsx (S0.2): the /mk pane's tabs */
-export type MkDashTab = 'overview' | 'lanes' | 'plan' | 'usage' | 'files' | 'events' | 'waiting' | 'inbox' | 'todo' | 'improve' | 'settings'
+export type MkDashTab = 'overview' | 'lanes' | 'plan' | 'usage' | 'files' | 'events' | 'waiting' | 'inbox' | 'bugs' | 'todo' | 'improve' | 'settings'
 
 export type MkFileAct = {
   path: string
@@ -237,12 +236,13 @@ export type MkWizardAgent = {
   models: readonly string[]
 }
 
+/** The project's gate commands (C3): the four names a plan's `use` list may name. Installers and
+ *  formatters are not gates — they change files. */
 export type MkWizardGates = {
-  install: string
   test: string
   typecheck: string
-  lint_changed: string
-  format_changed: string
+  lint: string
+  build: string
 }
 
 export type MkWizardDraft = {

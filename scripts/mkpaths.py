@@ -83,6 +83,14 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 TARGET_BUS_DIR = "bus"
 TARGET_PROJECTS_DIR = "projects"
 TARGET_PLANS_DIR = "plans"
+# bugs-tab DRAFT: <project folder>/bugs/<slug>.md drafts; an imported draft moves to bugs/archive/
+BUGS_DIR = "bugs"
+BUGS_ARCHIVE_DIR = "archive"
+# bugs-tab LANE: the permanent plan-less run (mkdb.BUGS_RUN); a migrated project keeps its run/task
+# folders at <project folder>/runs/bugs/<task>, never under the legacy data dir. A copy, not an
+# import: mkdb loads this module, so this module never loads mkdb at import time (an import cycle);
+# the self-test asserts the two are equal.
+BUGS_RUN = "bugs"
 
 
 class Fail(RuntimeError):
@@ -654,11 +662,22 @@ def runs_dir(data):
     return os.path.join(data, "runs")
 
 
+def _bugs_slug(data, run):
+    """The migrated project's slug when `run` is the plan-less bugs run, else None."""
+    if not (isinstance(run, str) and run.lower() == BUGS_RUN):
+        return None
+    return migrated_slug(data=data)
+
+
 def run_dir(data, run):
-    """<data>/runs/<run>, or the C2 <project>/plans/<plan>/runs/<run> for a migrated project."""
+    """<data>/runs/<run>, or the C2 <project>/plans/<plan>/runs/<run> for a migrated project (run
+    bugs, which has no plan: <project>/runs/bugs)."""
     plan = _run_plan(data, run)
     if plan:
         return target_run_dir(migrated_slug(data=data), plan, run)
+    slug = _bugs_slug(data, run)
+    if slug:
+        return os.path.join(target_project_dir(slug), "runs", BUGS_RUN)
     return os.path.join(runs_dir(data), run)
 
 
@@ -671,6 +690,8 @@ def task_dir(data, run, task):
     plan = _run_plan(data, run)
     if plan:
         return target_task_dir(migrated_slug(data=data), plan, run, task)
+    if _bugs_slug(data, run):
+        return os.path.join(run_dir(data, run), task)
     return os.path.join(tasks_dir(data, run), task)
 
 
@@ -734,6 +755,17 @@ def plan_legacy_files(data, plan, run_ids):
             if os.path.isdir(p):
                 out.append(p)
     return out
+
+
+def bugs_dir(data, home_arg=None):
+    """<project>/bugs — the project's bug draft files (bugs-tab DRAFT); the C2 project folder for a
+    migrated project. Never creates anything."""
+    return os.path.join(project_folder(data, home_arg), BUGS_DIR)
+
+
+def bugs_archive_dir(data, home_arg=None):
+    """<project>/bugs/archive — where an imported bug draft is moved."""
+    return os.path.join(bugs_dir(data, home_arg), BUGS_ARCHIVE_DIR)
 
 
 def plan_archives_dir(data, plan=None):
@@ -1471,6 +1503,8 @@ def self_test():
         _check(plan_dir(data, "p1") == os.path.join(data, "plans", "p1"), plan_dir(data, "p1"))
         _check(plan_archives_dir(data) == os.path.join(data, "plans", "archive"),
                plan_archives_dir(data))
+        _check(bugs_dir(data) == os.path.join(data, "bugs")
+               and bugs_archive_dir(data) == os.path.join(data, "bugs", "archive"), bugs_archive_dir(data))
         _check(watch_cursors(data) == os.path.join(data, CURSORS_NAME), watch_cursors(data))
         _check(usage_ledger() == os.path.join(tmp_home, "usage.json"), usage_ledger())
         _check(nudge_state(data) == os.path.join(data, "nudge-state.json"), nudge_state(data))
@@ -1766,6 +1800,7 @@ def self_test():
         _check(plan_archives_dir(data, "p1") == os.path.join(proj, "plans", "p1", "archive"),
                plan_archives_dir(data, "p1"))
         _check(project_folder(data) == proj, project_folder(data))
+        _check(bugs_archive_dir(data) == os.path.join(proj, "bugs", "archive"), bugs_archive_dir(data))
         # L10.1: the --data form of a MIGRATED project resolves to its C2 folder (fails on the old
         # literal rule); the old folder only on request, which is what mk-migrate's rollback asks for
         _check(project_dir(home_arg=tmp_home, data_dir=data) == proj, project_dir(home_arg=tmp_home, data_dir=data))
@@ -1784,6 +1819,20 @@ def self_test():
         _check(migrated_slug(data=proj) == "migs", migrated_slug(data=proj))
         _check(task_dir(proj, "nope", "T1") == os.path.join(proj, "runs", "nope", "tasks", "T1"),
                task_dir(proj, "nope", "T1"))
+        # bugs-tab LANE: the plan-less bugs run lives at <project>/runs/bugs (either --data form,
+        # any id case), never under the legacy data dir; an unmigrated project keeps <data>/runs/bugs
+        for d in (data, proj):
+            _check(run_dir(d, "bugs") == os.path.join(proj, "runs", "bugs"), run_dir(d, "bugs"))
+            _check(task_dir(d, "BUGS", "B1.1") == os.path.join(proj, "runs", "bugs", "B1.1"),
+                   task_dir(d, "BUGS", "B1.1"))
+        _bspec = importlib.util.spec_from_file_location(
+            "mkdb", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mkdb.py"))
+        _bmkdb = importlib.util.module_from_spec(_bspec)
+        _bspec.loader.exec_module(_bmkdb)
+        _check(BUGS_RUN == _bmkdb.BUGS_RUN, f"mkpaths.BUGS_RUN {BUGS_RUN!r} != mkdb.BUGS_RUN {_bmkdb.BUGS_RUN!r}")
+        plain = os.path.join(root, "plain-bugs")
+        _check(task_dir(plain, "bugs", "B1.1") == os.path.join(plain, "runs", "bugs", "tasks", "B1.1"),
+               task_dir(plain, "bugs", "B1.1"))
         # a p<hash> alias row ahead of the real row shares the db_path (live store today): the row
         # named like the folder still wins
         import sqlite3 as _sq

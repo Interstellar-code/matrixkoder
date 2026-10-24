@@ -223,7 +223,8 @@ def open_store(data):
 def pick_run(con, run):
     if run:
         return run
-    rows = [r["id"] for r in con.execute("SELECT id FROM runs WHERE status='active' ORDER BY started DESC")]
+    rows = [r["id"] for r in con.execute("SELECT id FROM runs WHERE status='active' ORDER BY started DESC")
+            if not mkdb.is_bugs_run(r["id"])]  # bugs-tab: the permanent bugs run is never the default
     if len(rows) != 1:
         raise Fail("--run is required" + (f" (active runs: {', '.join(rows)})" if rows else ""))
     return rows[0]
@@ -345,6 +346,20 @@ def self_test():
         assert "nope" in str(e)
     else:
         raise AssertionError("an unknown run must be refused")
+    # bugs-tab: the permanent bugs run (newest here) is never the picked run
+    bc = mkdb.open_project(tmp, data_dir=os.path.join(tmp, "bugs-data"))
+    bc.execute("INSERT INTO runs(id, plan, status, started) VALUES ('bugs',NULL,'active','2026-02-01')")
+    bc.commit()
+    try:
+        pick_run(bc, None)
+    except Fail as e:
+        assert "--run is required" in str(e) and "bugs" not in str(e), str(e)
+    else:
+        raise AssertionError("pick_run picked the bugs run")
+    bc.execute("INSERT INTO runs(id, plan, status, started) VALUES ('p1','p','active','2026-01-01')")
+    bc.commit()
+    assert pick_run(bc, None) == "p1" and pick_run(bc, "bugs") == "bugs"
+    bc.close()
     print("mk-report self-test ok")
 
 

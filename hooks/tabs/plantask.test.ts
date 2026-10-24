@@ -282,11 +282,10 @@ test('report render: the D1.5 panel at 36 cols, exactly as pasted (V1.5)', () =>
  *  per open reason. A panel without them shows none of those — the old
  *  binds render exactly as they do on main today. */
 
-test('F.8: the RISKY panel draws R5, the !! critical marker and one kind-points line per open reason', () => {
+test('F.8: the RISKY panel draws R5 and one kind-points line per open reason', () => {
   const risky: PlanTask = {
     id: 'X9', title: 'shield had a breach', status: 'stalled', right: 'stalled',
     risk: 5,
-    critical: true,
     openReasons: [
       { kind: 'review', points: 3, source: 'rv', opened: '2026-10-15T10:00:00Z' },
       { kind: 'gate', points: 2, source: 'tsc', opened: '2026-10-14T09:00:00Z' },
@@ -295,7 +294,7 @@ test('F.8: the RISKY panel draws R5, the !! critical marker and one kind-points 
   const drawn = PlanTaskPanel(stubEls(), risky, 80)
   const t = allText(drawn)
   expect(t, 'the risk rank is drawn as the R5 badge').toContain('R5')
-  expect(t, 'the critical marker !! is drawn near the badge').toContain('!!')
+  expect(t, 'the removed critical marker is not drawn').not.toContain('!!')
   expect(t, 'each reason lands its kind and points — review 3').toContain('review 3')
   expect(t, 'each reason lands its kind and points — gate 2').toContain('gate 2')
 })

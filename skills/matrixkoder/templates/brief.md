@@ -1,11 +1,14 @@
 # <PHASE> — <one-line goal>
 
-Repo: this folder (worktree `<path>`, branch `<branch>`, at `<sha>`: <what is already in>). Stack: <stack>. Plan `<plan id>`: `<project>/plans/<plan id>/plan.md` (read-only) — phase `<PHASE id>`, its tasks `<P.n>`, `<P.n>` (acceptance lines in the plan header); history for this task: `<project>/plans/<plan>/runs/<run>/<T>/` (read-only). Do ONLY <PHASE>. Other agents work on: <lanes + their areas> — do not touch them.
+Repo: this folder (worktree `<path>`, branch `<branch>`, at `<sha>`: <what is already in>). Stack: <stack>. Plan `<plan id>`: `<project>/plans/<plan id>/plan.md` (read-only) — plan goals: <G ids>; phase `<PHASE id>` goal: <phase goal>; task `covers`: <ids>; history for this task: `<project>/plans/<plan>/runs/<run>/<T>/` (read-only). Do ONLY <PHASE>. Other agents work on: <lanes + their areas> — do not touch them.
+
+Repo, bug variant (a task of run `bugs`, no plan; keep ONE Repo line, `mk-bug dispatch` fills this one): this folder (worktree `<path>`, branch `<branch>`, at `<sha>`). Stack: <stack>. Bug `<bug id>` (run `bugs`, no plan file) — task `<T>`; the bug's text and the task's acceptance are in Spec; history for this task: `<bug task folder>` (read-only). Do ONLY <T>. Other agents work on: <lanes + their areas> — do not touch them.
 
 What it is (plain English): <the task's description from the plan file; delete this line when the task has none>
 
 ## Risk and gates
-- Risk: <derived risk 1-5 from `mk-state risk list <T>`: base + open reasons (kind, points, source); "1, no open reasons" when none>. Critical: <yes | no>.
+- Risk: <derived risk 1-5 from `mk-state risk list <T>`: base + open reasons (kind, points, source); "1, no open reasons" when none>.
+- Covers: <the task's `covers` ids from the plan header>
 - Gates: <the task's plan gates, one per line as `name: cmd` (expect, timeout); "none" when it has none>. You run the ones in Commands.
 - A builder never writes a risk reason (no `risk add`/`risk clear`).
 
@@ -30,7 +33,7 @@ Test guidance (mk-store-r1; keep this short):
 <Name the REAL fixtures the tests must use: a copy of real run directories, real pane footers or API responses, the production code path with environment variables unset, forward references from the real plan. Require at least one test that runs the production path. Made-up data alone is not enough when real data exists.>
 
 ## Commands (wait for each)
-- Install: `<cmd>`
+- Install: `<cmd>` (from the lockfile; install is not a gate, so run it when the lockfile hash changed, e.g. `pnpm install --frozen-lockfile` / `uv sync`)
 - Tests: `<the self-tests of the changed scripts only, one command each, e.g. python3 scripts/<name>.py --self-test>` (known unrelated failures: <list or none>). Not the full suite unless this line says so; mk-builder skill R33.
 - Types: `<typecheck cmd>` must stay at **<baseline>**; nothing new in <owned paths>
 - Lint/format ONLY changed files: `<lint cmd> <files>`, `<format cmd> <files>` — never repo-wide

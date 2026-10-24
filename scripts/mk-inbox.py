@@ -4,10 +4,14 @@
 
   list --json [--home DIR] [--data DIR]
                          one JSON line: {ok, files:[{id, path, title, fit, sections_found,
-                         sections_total, missing, age_s, archived, note}], counts:{inbox, template,
-                         fix, archived}}. Never writes or moves a plan file. The class of each file is
-                         `mk-plan.py check --classify` (a subprocess, the C2 reply); nothing is parsed
-                         twice. It records inbox events (below) in the project store, best effort.
+                         sections_total, missing, age_s, archived, note, blocks}], counts:{inbox,
+                         template, fix, archived}}. Never writes or moves a plan file. The class of
+                         each file is `mk-plan.py check --classify` (a subprocess, the C2 reply).
+                         The count is `n of 9 blocks found` (and the missing block names) for a
+                         numbered-block plan, read by mk-plan.py's own block reader, loaded as a
+                         module so this script keeps no second parser; an old-format plan keeps
+                         `n of 7 sections found`. `blocks` says which noun a card uses. It records
+                         inbox events (below) in the project store, best effort.
   import <id>            mk-plan.py import into the project store, in three reported steps; a flat
                          <topic>.md then moves to inbox/archive/ (a plan folder moves itself)
   archive <id>           inbox/ -> inbox/archive/ (refused when the target exists)
@@ -45,10 +49,15 @@ def _load(name, file):
 
 
 mkpaths = _load("mkpaths", "mkpaths.py")
+mk_plan = _load("mk_plan", "mk-plan.py")  # CONSUM.1: the block counter reads its parser, never a copy
 
 ARCHIVE, DELETED = "archive", ".deleted"
 STEPS = {1: "Parse the template", 2: "Write the project", 3: "Write the tasks"}
 NOT_A_PLAN_NOTE = "no phase or task headings"
+# The numbered blocks a plan is counted by, in order (templates/plan.md). Block 10 (Notes) is not
+# counted: it is the template's own how-to, deleted when a plan is written.
+BLOCKS = ((1, "Top block"), (2, "Summary"), (3, "Goal"), (4, "Design / context"),
+          (5, "Phases"), (6, "Gates"), (7, "Risks"), (8, "Open questions"), (9, "Log"))
 
 
 class Fail(Exception):
@@ -92,8 +101,38 @@ def split_header(text):
 PLAN_LINE = re.compile(r"""^plan\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')""", re.M)
 
 
-def plan_id_of(text, stem):
-    """The header's plan = "..." value; no header (or no plan line) -> the file name without .md."""
+def block_plan_of(text):
+    """(id, title, the missing block names) of a numbered-block plan, read by mk-plan.py's own
+    reader — this file keeps no second parser. None for an old-format file and for one the reader
+    refuses; those keep the header and H1 fallbacks below.
+
+    A block counts as found when its number is there AND the parser resolves it by name, so a block
+    renamed (`+++ 7 Hazards`) is reported missing rather than counted. Block 5 is the exception:
+    block_by_name skips 5 to avoid the phases' own 5.n blocks, and the phases are read from those."""
+    if not mk_plan.is_block_format(text):
+        return None
+    try:
+        _header, out, _sha = mk_plan.read_block_plan(text)
+        blocks = mk_plan.parse_blocks(text)
+    except mk_plan.Fail:
+        return None
+    nums = {b["num"] for b in blocks}
+    missing = [name for num, name in BLOCKS
+               if str(num) not in nums or (str(num) != "5" and mk_plan.block_by_name(blocks, name) is None)]
+    pid = str(out.get("plan") or "")
+    h1 = str((out.get("summary") or {}).get("title") or "")
+    # the same H1 rule the parser uses for a plan title: the text after the em dash
+    title = mk_plan.plan_title(f"# {h1}", pid) if h1 else ""
+    return {"id": pid, "title": title, "found": len(BLOCKS) - len(missing),
+            "total": len(BLOCKS), "missing": missing}
+
+
+def plan_id_of(text, stem, blk=None):
+    """The plan = "..." of block 1 or of the old header; neither -> the file name without .md.
+    `blk` is block_plan_of(text) when the caller already read it."""
+    blk = block_plan_of(text) if blk is None else blk
+    if blk and blk["id"].strip():
+        return blk["id"].strip()
     header, _ = split_header(text)
     m = PLAN_LINE.search(header) if header is not None else None
     found = (m.group(1) if m.group(1) is not None else m.group(2)) if m else ""
@@ -153,9 +192,17 @@ def all_entries(box):
     return scan(box, False) + scan(os.path.join(box, ARCHIVE), True)
 
 
-def check_plan_file(md, data, home):
+def check_plan_file(md, data, home, blk=None):
     """Run mk-plan.py check --classify on one file (the C2 reply). Never raises: a file the check cannot
-    class is not_a_plan with the reason as its note."""
+    class is not_a_plan with the reason as its note.
+
+    An old-format file keeps the C2 reply as it is (seven sections, four parts). A block-format file
+    is counted in blocks instead, by the same parser (CONSUM.1): `n of 9 blocks found` and the names
+    of the missing ones. A block name the block reader found is never also named missing by the
+    check, and any missing block (or part) makes the fit `partial`, never `template`.
+    `blk` is block_plan_of(text) when the caller already read it."""
+    if blk is None and os.path.isfile(md):
+        blk = block_plan_of(read_text(md))
     env = dict(os.environ)
     if data:
         env["MATRIXKODER_DATA"] = data
@@ -172,6 +219,20 @@ def check_plan_file(md, data, home):
     if fit not in ("template", "partial", "not_a_plan"):
         return {"fit": "not_a_plan", "sections_found": 0, "sections_total": 7, "missing": [],
                 "note": errors[0] if errors else NOT_A_PLAN_NOTE, "errors": errors, "warnings": []}
+    if blk is not None:  # the block count replaces the seven-section one, for this file only
+        # The check reads the body's `## ` headings, so it can name a block the block reader
+        # found (block 4's heading is not body-parsed the same way). A block name is never
+        # both found and missing: the block reader's list is the whole truth for those nine.
+        # The check's other names (no task, no acceptance, no gate) are named alongside.
+        names = {name for _num, name in BLOCKS}
+        missing = blk["missing"] + [m for m in (reply.get("missing") or [])
+                                    if m not in blk["missing"] and m not in names]
+        if fit == "template" and missing:
+            fit = "partial"  # a missing block or part is never a clean template
+        note = NOT_A_PLAN_NOTE if fit == "not_a_plan" else ""
+        return {"fit": fit, "sections_found": blk["found"], "sections_total": blk["total"],
+                "missing": missing, "note": note, "errors": errors,
+                "warnings": [str(w) for w in reply.get("warnings") or []]}
     return {"fit": fit, "sections_found": reply.get("sections_found", 0),
             "sections_total": reply.get("sections_total", 7), "missing": list(reply.get("missing") or []),
             "note": NOT_A_PLAN_NOTE if fit == "not_a_plan" else "", "errors": errors,
@@ -181,16 +242,22 @@ def check_plan_file(md, data, home):
 def describe(e, data, home, now):
     """One C3 entry (plus `note`) for a scanned entry."""
     text = read_text(e["md"])
-    pid = plan_id_of(text, e["stem"])
+    blk = block_plan_of(text)
+    pid = (blk["id"].strip() if blk else "") or plan_id_of(text, e["stem"], blk)
     _, body = split_header(text)
-    cls = check_plan_file(e["md"], data, home)
+    cls = check_plan_file(e["md"], data, home, blk)
     try:
         age = max(0, int(now - os.stat(e["md"]).st_mtime))
     except OSError:
         age = 0
-    return {"id": pid, "path": e["shown"], "title": title_of(body, pid), "fit": cls["fit"],
+    title = ((blk["title"] or pid) if blk else "") or title_of(body, pid)
+    return {"id": pid, "path": e["shown"], "title": title, "fit": cls["fit"],
             "sections_found": cls["sections_found"], "sections_total": cls["sections_total"],
-            "missing": cls["missing"], "age_s": age, "archived": e["archived"], "note": cls["note"]}
+            "missing": cls["missing"], "age_s": age, "archived": e["archived"], "note": cls["note"],
+            # CONSUM.1: which noun the count reads with — `n of 9 blocks found` for a numbered-block
+            # plan, `n of 7 sections found` for an old-format one. The counts themselves keep the
+            # reply's existing names so a reader does not learn a second pair.
+            "blocks": blk is not None}
 
 
 # ---------- inbox events (C5) ----------
@@ -276,8 +343,9 @@ def cmd_list(a):
             if key not in found:
                 log.write("found", f["path"], f["id"], f["fit"], f"found {where}")
             if checked.get(key) != sig:
+                noun = "blocks" if f["blocks"] else "sections"
                 log.write("checked", f["path"], f["id"], f["fit"],
-                          f"checked {where}: {f['fit']}, {f['sections_found']} of {f['sections_total']} sections",
+                          f"checked {where}: {f['fit']}, {f['sections_found']} of {f['sections_total']} {noun}",
                           sections_found=f["sections_found"], sections_total=f["sections_total"], missing=f["missing"])
     live = [f for f in files if not f["archived"]]
     counts = {"inbox": len(live), "template": sum(f["fit"] == "template" for f in live),
@@ -548,7 +616,8 @@ def main(argv):
 
 def self_test():
     mk_config = _load("mk_config", "mk-config.py")
-    # byte copies of two real plans taken 2026-10-21: plan-inbox-and-parsing (a template plan) and mk-ponytail-hooks (no phase blocks)
+    # two real plans, rewritten in the numbered-block format (CONSUM.2): plan-inbox-and-parsing
+    # (a template plan, all nine blocks) and mk-ponytail-hooks (no phase blocks, so not a plan)
     real_tpl = os.path.join(HERE, "fixtures", "inbox-plan-template.md")
     real_not = os.path.join(HERE, "fixtures", "inbox-plan-not-a-plan.md")
     tmp = tempfile.mkdtemp(prefix="mk-inbox-test-")
@@ -622,9 +691,35 @@ def self_test():
         _, out = mi("list", "--json")
         assert out["ok"] and out["files"] == [], out
 
-        # a partial: the real template plan with its Risks section heading renamed away
-        assert "## Risks" in tpl_text, "the real plan lost its Risks section"
-        partial = tpl_text.replace("## Risks", "## Hazards", 1).replace('plan = "plan-inbox-and-parsing"', 'plan = "inbox-partial"', 1)
+        # a partial: the real template plan with block 7 (Risks) removed whole
+        assert "+++ 7 Risks" in tpl_text, "the real plan lost its Risks block"
+
+        def without_block(text, header):
+            """`text` with the whole numbered block that opens with `header` removed."""
+            i = text.index(header)
+            j = text.index("\n/+++\n", i) + len("\n/+++\n")
+            return text[:i] + text[j:]
+
+        partial = without_block(tpl_text, "+++ 7 Risks").replace(
+            'plan = "plan-inbox-and-parsing"', 'plan = "inbox-partial"', 1)
+
+        # A1/A2: a block name is never both found and missing, and a plan missing a block is
+        # never a clean template. Both cases are checked in-process off the template text.
+        names = {name for _num, name in BLOCKS}
+        def blocks_of(text):
+            path = put("probe.md", text)
+            got = check_plan_file(path, data, home)
+            os.unlink(path)
+            return got
+        no_gates = without_block(without_block(tpl_text, "+++ 6.0 Gate settings"), "+++ 6 Gates")
+        got = blocks_of(no_gates)
+        assert got["fit"] == "partial" and got["sections_found"] + len([m for m in got["missing"] if m in names]) == 9, got
+        assert "Gates" in got["missing"] and got["sections_found"] == 8, got
+        renamed = tpl_text.replace("+++ 7 Risks", "+++ 7 Hazards", 1)
+        got = blocks_of(renamed)
+        assert got["fit"] == "partial" and "Risks" in got["missing"], got
+        assert "Hazards" not in got["missing"] and got["sections_found"] == 8, got
+        assert got["sections_found"] + len([m for m in got["missing"] if m in names]) == 9, got
         put("plan-inbox-and-parsing.md", tpl_text)
         put("inbox-partial.md", partial)
         put("ponytail-notes.md", not_text)
@@ -641,20 +736,26 @@ def self_test():
         assert sorted(by) == ["inbox-partial.md", "loose-note.md", "old-one.md", "plan-inbox-and-parsing.md", "ponytail-notes.md"], sorted(by)
         t = by["plan-inbox-and-parsing.md"]
         assert t["id"] == "plan-inbox-and-parsing" and t["fit"] == "template" and t["missing"] == [], t
-        assert t["sections_found"] == t["sections_total"] == 7 and t["archived"] is False and t["age_s"] >= 0, t
+        assert t["sections_found"] == t["sections_total"] == 9 and t["archived"] is False and t["age_s"] >= 0, t
+        assert t["blocks"] is True, t  # CONSUM.1: the count reads `n of 9 blocks found`
         assert t["title"] and t["title"] != t["id"], t
         p = by["inbox-partial.md"]
         assert p["id"] == "inbox-partial" and p["fit"] == "partial" and p["missing"] == ["Risks"], p
-        assert p["sections_found"] == 6 and p["sections_total"] == 7, p
+        assert p["sections_found"] == 8 and p["sections_total"] == 9 and p["blocks"] is True, p
+        for f in out["files"]:  # A1: a block name is found or missing, never both
+            if f["blocks"]:
+                assert f["sections_found"] + len([m for m in f["missing"] if m in names]) == 9, f
         n = by["ponytail-notes.md"]
         assert n["id"] == "mk-ponytail-hooks" and n["fit"] == "not_a_plan" and n["note"] == NOT_A_PLAN_NOTE, n  # the id is the header's, not the file name
         s = by["loose-note.md"]  # no header at all: not_a_plan, never an error, the id falls back to the file name
         assert s["id"] == "loose-note" and s["fit"] == "not_a_plan" and s["title"] == "just some thoughts", s
+        assert s["blocks"] is False and s["sections_total"] == 7, s  # an old-format file keeps its seven sections
         a_ = by["old-one.md"]
         assert a_["archived"] is True and a_["id"] == "old-one" and a_["fit"] == "template", a_
         assert out["counts"] == {"inbox": 4, "template": 1, "fix": 3, "archived": 1}, out["counts"]
         for f in out["files"]:
-            assert set(f) == {"id", "path", "title", "fit", "sections_found", "sections_total", "missing", "age_s", "archived", "note"}, f
+            assert set(f) == {"id", "path", "title", "fit", "sections_found", "sections_total", "missing",
+                              "age_s", "archived", "note", "blocks"}, f
             assert not os.path.isabs(f["path"]), f
 
         # ---- EVT.1 list records `found` once per new file and `checked` when its class changes ----
@@ -683,6 +784,16 @@ def self_test():
             f.write(partial)
         mi("list", "--json")  # back to the partial class: one more `checked`
         assert len(evs()) == n_before + 2, evs()
+
+        # CONSUM.1: an old-format plan in the inbox keeps today's behaviour — seven sections, no
+        # block count. `fixtures/plan-link.md` is the real old-format plan kept for this.
+        legacy = open(os.path.join(HERE, "fixtures", "plan-link.md")).read()
+        put("legacy-plan.md", legacy)
+        _, out = mi("list", "--json")
+        lg = next(f for f in out["files"] if f["path"] == "legacy-plan.md")
+        assert lg["id"] == "plan-link" and lg["blocks"] is False and lg["sections_total"] == 7, lg
+        assert lg["missing"] and all(m in ("Summary", "Phases", "final gate") for m in lg["missing"]), lg
+        os.unlink(os.path.join(box, "legacy-plan.md"))
 
         # a folder-form plan lists (path is <folder>/plan.md) and archives, folder intact
         put("fold-plan/plan.md", tpl_text.replace('plan = "plan-inbox-and-parsing"', 'plan = "fold-plan"', 1))

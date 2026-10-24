@@ -52,7 +52,6 @@ export type PlanRow = {
   readonly project?: string
   /** Detail header extras the loader will fill; optional so a bare C8 row renders */
   readonly mergesTo?: string
-  readonly design?: readonly string[]
 }
 
 /** C8: the view the loader fills. `onAction` is injected with the view so this

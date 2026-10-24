@@ -334,81 +334,149 @@ def run_tool(script, *args, home, data=None, timeout=120, ok=(0,), extra_env=Non
 
 # --------------------------------------------------------------------------- the plan
 
-PLAN_TEMPLATE = """+++
+PLAN_TEMPLATE = """+++ 1 Top block — plan identity [toml]
 plan = "{plan}"
 status = "draft"
 created = {created}
 runs = []
-design = ["research.md"]
 integration = "mk/{plan}/integration"
+/+++
 
-[gates]
-test = "python3 scripts/mk-e2e-layout.py --self-test"
-typecheck = "python3 -m py_compile scripts/mk-e2e-layout.py"
-selftest = "python3 scripts/mk-e2e-layout.py --self-test"
-validate = "claude plugin validate ."
++++ 2 Summary
+# {plan} — the mock feature of the e2e layout run
 
-[[phase]]
+## Summary
+- Phases: 2 — P1: first phase of the mock feature; P2: second phase of the mock feature
+- Method: waves · subagents off
+- Lanes: P1 (own lane); P2 (own lane)
+- Delivery: mk/{plan}/integration · pushed: no
+- Gates: test; typecheck
+/+++
+
++++ 3 Goal
+## Goal
+- Done when:
+  - G1 — the two phases merge in order into the integration branch
+- Why: the e2e layout audit drives a whole project through the C2 tree
+- From: the self-test
+- Sources: `research.md`
+/+++
+
++++ 4 Design / context
+## Design / context
+### What is wrong today
+1. none, this is new
+### Shape of the change
+Two phases with three tasks; the mock feature adds `scripts/a.py`, `scripts/b.py` and `scripts/c.py`.
+### Contracts
+C1 — the phase file each phase writes — written by P1, read by P2
+### Test plan
+T1 — the two phases merge and the audit passes — end-to-end — `scripts/mk-e2e-layout.py` — written by P2.1
+### Assumptions and dependencies
+none
+### Rollout and undo
+R1 — ships by merge; undo = revert the merge — P2.1
+### Settings and limits
+S1 — most lanes at once — 3 — mk-config.py list --json — 2026-10-15
+### Out of scope
+Nothing.
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1 — first phase of the mock feature
+### P1 — first phase of the mock feature
+- Goal: `scripts/a.py` exists and its self-test passes
+- Serves: G1
+- Needs first: nothing
+- Build order: P1.1 then P1.2
+- Hazards: none
+- Carries: C1, T1
+/+++
+
++++ 5.1.0 P1 settings [toml]
 id = "P1"
 title = "first phase of the mock feature"
 wave = 1
-deps = []
 owned = ["scripts/a.py"]
-forbidden = []
-route = ""
-reviewer = ""
-size = "standard"
-risk = "reversible"
-review = "light"
-qa = []
 commit = "feat(a): the first phase"
 subagents = false
-lane_group = ""
+/+++
 
-  [[phase.task]]
-  id = "P1.1"
-  title = "first task of the mock feature"
-  acceptance = "scripts/a.py exists and its self-test passes"
-  subagent = false
-  owned = []
++++ 5.1.1 P1.1 — first task of the mock feature [toml]
+id = "P1.1"
+title = "first task of the mock feature"
+covers = ["C1", "T1"]
+acceptance = ["scripts/a.py exists and its self-test passes"]
+risk = 1
+/+++
 
-  [[phase.task]]
-  id = "P1.2"
-  title = "second task of the mock feature"
-  acceptance = "scripts/b.py exists and its self-test passes"
-  subagent = false
-  owned = []
++++ 5.1.2 P1.2 — second task of the mock feature [toml]
+id = "P1.2"
+title = "second task of the mock feature"
+acceptance = ["scripts/b.py exists and its self-test passes"]
+risk = 1
+/+++
 
-[[phase]]
++++ 5.2 P2 — second phase of the mock feature
+### P2 — second phase of the mock feature
+- Goal: `scripts/c.py` exists and its self-test passes
+- Serves: G1
+- Needs first: P1, because the second phase merges after the first
+- Build order: P2.1
+- Hazards: none
+- Carries: T1, R1
+/+++
+
++++ 5.2.0 P2 settings [toml]
 id = "P2"
 title = "second phase of the mock feature"
 wave = 2
-deps = ["P1"]
 owned = ["scripts/c.py"]
-forbidden = []
-route = ""
-reviewer = ""
-size = "standard"
-risk = "reversible"
-review = "light"
-qa = []
 commit = "feat(c): the second phase"
+deps = ["P1"]
 subagents = false
-lane_group = ""
+/+++
 
-  [[phase.task]]
-  id = "P2.1"
-  title = "third task of the mock feature"
-  acceptance = "scripts/c.py exists and its self-test passes"
-  subagent = false
-  owned = []
-+++
++++ 5.2.1 P2.1 — third task of the mock feature [toml]
+id = "P2.1"
+title = "third task of the mock feature"
+covers = ["T1", "R1"]
+acceptance = ["scripts/c.py exists and its self-test passes"]
+risk = 1
+/+++
+
++++ 6 Gates
+## Gates
+- test — proves G1 — the project's test gate passes
+- typecheck — proves G1 — the project's typecheck gate passes
+/+++
+
++++ 6.0 Gate settings [toml]
+timeout = 1200
+/+++
+
++++ 7 Risks
+## Risks
+- K1 — the phases merge out of order — level 3 — guard: T1, the end-to-end run — P2.1
+/+++
+
++++ 8 Open questions
+## Open questions
+/+++
+
++++ 9 Log
+## Log
+- {created} — drafted — the mock feature of the e2e layout run — user
+/+++
 """
 
 
 def write_plan(repo, plan_id):
     """The plan file, written from skills/matrixkoder/templates/plan.md's shape, plus the
-    design ref assets/ will carry."""
+    design note the Goal block's `Sources:` line names and assets/ will carry."""
     path = os.path.join(repo, f"{plan_id}.md")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(PLAN_TEMPLATE.format(plan=plan_id, created="2026-10-15"))
@@ -1284,7 +1352,7 @@ AUDIT_BAK_PREFIXES = tuple(n + ".bak-" for n in AUDIT_ROOT_STORES)
 AUDIT_PROJECT_FILES = {n + suf for n in AUDIT_PROJECT_STORES for suf in ("", "-wal", "-shm")} | {
                        mkpaths.PROJECT_YAML_NAME, mkpaths.PROJECT_YAML_NAME + ".lock", mkpaths.PROJECT_YAML_NAME + ".bak",
                        ".migrate.json"}
-AUDIT_PROJECT_DIRS = {mkpaths.TARGET_PLANS_DIR, "archive", "runs", "legacy"}   # legacy/ = the user-confirmed `--archive` tarball of the old data dir
+AUDIT_PROJECT_DIRS = {mkpaths.TARGET_PLANS_DIR, "archive", "runs", "legacy", mkpaths.BUGS_DIR}   # legacy/ = the user-confirmed `--archive` tarball of the old data dir; bugs/ = bug draft files
 AUDIT_PLAN_ENTRIES = {"plan.md", "assets", "archive", "runs"}
 # the root store also carries mk-catalog's C8 tables (agents, catalog_user, models) and the user's todos table
 AUDIT_ROOT_CATALOG_TABLES = {"agents", "catalog_user", "models", "todos"}   # optional: allowed when present, never required
@@ -1343,6 +1411,13 @@ def _audit_tree_rules(home):
                     # stray FOLDER name is drift
                     plan_files = _audit_scan(os.path.join(home, rel, "plans", plan))[0]
                     _audit_names(home, f"{rel}/plans/{plan}", plan_files, AUDIT_PLAN_ENTRIES - {"plan.md"}, names)
+            if mkpaths.BUGS_DIR in pdirs:
+                # bug drafts: <slug>.md files and archive/ (imported drafts, also *.md)
+                for sub in (mkpaths.BUGS_DIR, os.path.join(mkpaths.BUGS_DIR, mkpaths.BUGS_ARCHIVE_DIR)):
+                    if os.path.isdir(os.path.join(home, rel, sub)):
+                        b_files = _audit_scan(os.path.join(home, rel, sub))[0]
+                        ok = {mkpaths.BUGS_ARCHIVE_DIR} if sub == mkpaths.BUGS_DIR else set()
+                        _audit_names(home, f"{rel}/{sub}", {n for n in b_files if n.endswith(".md")}, ok, names)
     if mkpaths.TARGET_BUS_DIR in top_dirs:
         bus = mkpaths.TARGET_BUS_DIR
         _, bdirs = _audit_names(home, bus, AUDIT_BUS_FILES, {mkpaths.TARGET_LANES_DIR}, names)
@@ -1793,6 +1868,13 @@ def _audit_mutations():
         with open(os.path.join(f["home"], "notes.txt"), "w") as fh:
             fh.write("x")
 
+    @m("A01", "a non-draft file in a project's bugs folder", "notes.txt")
+    def _(f):
+        bugs = mkpaths.bugs_dir(mkpaths.target_project_dir(f["slug"], f["home"]))
+        os.makedirs(bugs, exist_ok=True)
+        with open(os.path.join(bugs, "notes.txt"), "w") as fh:
+            fh.write("x")
+
     @m("A02", "a missing table in the project DB", "watch_cursors")
     def _(f):
         _drop_table(f, "watch_cursors")
@@ -1957,6 +2039,21 @@ def audit_self_test():
             fh.write(b"old root store")
         rep = do_audit(home)
         _check(rep["ok"], f"the old root store beside the new one fails the audit: {[r for r in rep['rules'] if not r['pass']]}")
+        # (e) bug drafts: bugs/<slug>.md and bugs/archive/<slug>.md
+        bugs = mkpaths.bugs_dir(mkpaths.target_project_dir(f["slug"], home))
+        os.makedirs(mkpaths.bugs_archive_dir(mkpaths.target_project_dir(f["slug"], home)))
+        for p in (os.path.join(bugs, "crash.md"), os.path.join(bugs, mkpaths.BUGS_ARCHIVE_DIR, "old.md")):
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("+++\ntitle = \"x\"\n+++\n")
+        rep = do_audit(home)
+        _check(rep["ok"], f"bug drafts fail the audit: {[r for r in rep['rules'] if not r['pass']]}")
+        # (f) bugs-tab LANE: run bugs' task folders at <project>/runs/bugs/<task>/ (mkpaths.task_dir)
+        bug_task = os.path.join(mkpaths.target_project_dir(f["slug"], home), "runs", mkpaths.BUGS_RUN, "B1.1")
+        os.makedirs(bug_task)
+        with open(os.path.join(bug_task, "brief-r1.md"), "w", encoding="utf-8") as fh:
+            fh.write("# B1.1 brief\n")
+        rep = do_audit(home)
+        _check(rep["ok"], f"run bugs' runs/bugs/ folder fails the audit: {[r for r in rep['rules'] if not r['pass']]}")
         _check(_audit_exit(home) == 0, "audit exit code is not 0 with the L10.Y shapes")
     finally:
         shutil.rmtree(f["root"], ignore_errors=True)

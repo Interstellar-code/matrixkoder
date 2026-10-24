@@ -150,6 +150,21 @@ test('plansFromOverview keeps only the active project\'s plans', () => {
   expect(other.plans.map(p => p.id)).toEqual(['beta-plan'])
 })
 
+test('BRUN.1: the permanent bugs row is never a plan or an ongoing run; other rows are unchanged', () => {
+  // The overview holds one plan_summary row per project with plan = live_run = "bugs".
+  const bugs = { project: 'alpha', plan: 'bugs', title: 'Bugs', status: 'running', live_run: 'bugs', counts: { building: 2 } }
+  const withBugs = { ...TWO_PROJECTS, plans: [bugs, ...TWO_PROJECTS.plans] }
+  expect(plansFromOverview(withBugs)).toEqual(plansFromOverview(TWO_PROJECTS))
+  const active = plansFromOverview(withBugs, '/home/mk/projects/alpha')
+  expect(active.plans.map(p => p.id)).toEqual(['alpha-plan'])
+  expect(active.runs).toEqual([])
+
+  const live = { id: 'p', title: 'T', status: 'running', created: 'c', runs: ['p-r1'], live_run: 'p-r1', counts: { building: 1 } }
+  const listed = plansFromReply({ ok: true, plans: [{ ...live, id: 'bugs', runs: ['bugs'], live_run: 'bugs' }, live] })
+  expect(listed).toEqual(plansFromReply({ ok: true, plans: [live] }))
+  expect(listed.runs.map(r => r.id)).toEqual(['p-r1'])
+})
+
 test('Z20.4a: an empty or missing activeDir keeps every plan (null, not an empty filter)', () => {
   expect(plansFromOverview(TWO_PROJECTS, null).plans.map(p => p.id)).toEqual(['alpha-plan', 'beta-plan'])
   // a reply whose projects lists nothing is a pre-projects root: no filter
@@ -252,7 +267,7 @@ test('Z18.3: branch-selection absent from matrixkoder list, matrixkoder plans pr
  *  leaves them ABSENT (undefined, not null / 0 / false) when the raw row
  *  carries none. */
 
-test('F.8: planFromReply maps a task row\'s risk, critical and open_reasons onto the PlanTask', () => {
+test('F.8: planFromReply maps a task row\'s risk and open_reasons onto the PlanTask', () => {
   const RAW_REASON = { kind: 'review', points: 3, source: 'rv', opened: '2026-10-15T10:00:00Z' }
   const view = planFromReply({
     ok: true,
@@ -266,7 +281,7 @@ test('F.8: planFromReply maps a task row\'s risk, critical and open_reasons onto
       tasks: [{
         id: 'T9', title: 'risky task', status: 'building', type: 'task', round: 0, verdict: null,
         risk: 4,
-        critical: true,
+        critical: true, // a removed field: the mapper ignores it
         open_reasons: [RAW_REASON],
       }],
     }],
@@ -274,7 +289,7 @@ test('F.8: planFromReply maps a task row\'s risk, critical and open_reasons onto
   const row = view.phases?.find(p => p.id === 'P1')?.rows.find(t => t.id === 'T9')
   expect(row, 'the risky task is mapped').toBeDefined()
   expect(row?.risk, 'the raw `risk: 4` passes through').toBe(4)
-  expect(row?.critical, 'the raw `critical: true` passes through').toBe(true)
+  expect('critical' in (row ?? {}), 'critical is not mapped at all').toBe(false)
   expect(row?.openReasons, 'the open_reasons list is landed as the same objects').toEqual([RAW_REASON])
   expect(row?.openReasons?.[0]?.kind).toBe('review')
   expect(row?.openReasons?.[0]?.points).toBe(3)
@@ -282,7 +297,7 @@ test('F.8: planFromReply maps a task row\'s risk, critical and open_reasons onto
   expect(row?.openReasons?.[0]?.opened).toBe('2026-10-15T10:00:00Z')
 })
 
-test('F.8: a task row with none of the three keys maps WITHOUT them — undefined, not null/0/false', () => {
+test('F.8: a task row with none of the keys maps WITHOUT them — undefined, not null/0/false', () => {
   const view = planFromReply({
     ok: true,
     id: 'calmplan',
@@ -293,7 +308,6 @@ test('F.8: a task row with none of the three keys maps WITHOUT them — undefine
   const calm = view.phases?.[0]?.rows[0]
   expect(calm, 'the bare task is mapped').toBeDefined()
   expect(calm?.risk, 'risk stays absent (undefined, not 0)').toBeUndefined()
-  expect(calm?.critical, 'critical stays absent (undefined, not false)').toBeUndefined()
   expect(calm?.openReasons, 'openReasons stays absent (undefined, not [])').toBeUndefined()
   // the keys are absent, never a made-up value
   expect('risk' in (calm ?? {})).toBe(false)
@@ -360,7 +374,7 @@ test('natural task id order without ICU: Z9 < Z10 < Z20, digits before text (Z27
   expect(naturalCompare('F.10', 'F.S')).toBeLessThan(0)
 })
 
-test('description maps at plan, phase, task and subtask level; blank and non-string are absent', () => {
+test('description maps at phase, task and subtask level; a phase Goal fills its slot; blank and non-string are absent', () => {
   const view = planFromReply({
     ok: true, id: 'p', title: 'T', status: 'running', description: '  Why this plan exists.  ',
     phases: [
@@ -373,19 +387,21 @@ test('description maps at plan, phase, task and subtask level; blank and non-str
       { id: 'P3', title: 'Typed', status: 'planned', description: 7,
         tasks: [{ id: 'P3.1', title: 'Typed', status: 'planned', description: ['x'],
           subtasks: [{ id: 'P3.1a', title: 'Sub', status: 'planned', description: null }] }] },
+      { id: 'P4', title: 'Goal', status: 'planned', description: 'The old text.', goal: ' The phase goal. ',
+        tasks: [] },
     ],
   })
-  expect(view.plan?.description).toBe('Why this plan exists.')
+  // the plan-level description is a removed field: it never lands on the view
+  expect(view.plan).not.toHaveProperty('description')
   expect(view.phases?.[0]?.description).toBe('A phase.')
   expect(view.phases?.[0]?.rows[0]?.description).toBe('A task.')
   expect(view.phases?.[0]?.rows[0]?.subs?.[0]?.description).toBe('A subtask.')
+  // the phase slot is fed the Goal when the reply carries one
+  expect(view.phases?.[3]?.description).toBe('The phase goal.')
   for (const p of [view.phases?.[1], view.phases?.[2]]) {
     expect(p).not.toHaveProperty('description')
     expect(p?.rows[0]).not.toHaveProperty('description')
     expect(p?.rows[0]?.subs?.[0]).not.toHaveProperty('description')
-  }
-  for (const bad of ['', '  ', 5, null, {}]) {
-    expect(planFromReply({ ok: true, id: 'p', description: bad }).plan).not.toHaveProperty('description')
   }
 })
 

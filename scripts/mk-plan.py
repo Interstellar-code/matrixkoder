@@ -78,6 +78,8 @@ REVIEWS = ("light", "standard", "data-loss")
 PLAN_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,40}")
 PHASE_ID_RE = re.compile(r"[A-Z][A-Z0-9]{0,7}")
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+# bugs-tab: plan id `bugs` would collide with the permanent bugs run's plan_summary row
+RESERVED_PLAN_ERR = "plan id 'bugs' is reserved for the project's bugs run: pick another plan id"
 ROUTE_RE = re.compile(r"\S+( \S+){1,2}")  # "<agent> <model> [<effort>]"; "" means Jev
 TOP_KEYS = ("plan", "status", "runs", "gates", "final_gate", "phase")  # header keys consumed by C2
 FINAL_EVERY = ("merge", "phase", "run_end")  # when a [[final_gate]] runs (F.2)
@@ -132,14 +134,30 @@ def load(path):
 
 def split_plan(text):
     """(lines, close): lines[0] is the opening +++, lines[close] the closing one.
-    A leading BOM stays on lines[0] so rewrites keep it; the +++ check ignores it."""
+    A leading BOM stays on lines[0] so rewrites keep it; the +++ check ignores it.
+    For block format (lines[0] starts with '+++ '), close is the line index of
+    the '/+++' closing Block 1."""
     lines = text.split("\n")
-    if not lines or lines[0].lstrip("\ufeff").strip() != "+++":
+    if not lines:
         raise Fail(["line 1: first line must be '+++'"])
-    for i in range(1, len(lines)):
-        if lines[i].strip() == "+++":
-            return lines, i
-    raise Fail([f"line {len(lines)}: no closing '+++' for the header"])
+    first = lines[0].lstrip("\ufeff").strip()
+    if first == "+++":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "+++":
+                return lines, i
+        raise Fail([f"line {len(lines)}: no closing '+++' for the header"])
+    elif first.startswith("+++ "):
+        m = re.match(r"^\+\+\+\s+([0-9.]+)\s+(.*?)(?:\s+\[toml\])?$", first)
+        if not m or not m.group(2).strip():
+            raise Fail([f"line 1: '+++ ' header does not match block pattern: '{lines[0]}'"])
+        for i in range(1, len(lines)):
+            if lines[i].strip().startswith("+++ "):
+                raise Fail([f"line {i + 1}: '+++ ' header before previous block closed with '/+++'"])
+            if lines[i].strip() == "/+++":
+                return lines, i
+        raise Fail([f"line {len(lines)}: no closing '/+++' for block 1"])
+    else:
+        raise Fail(["line 1: first line must be '+++'"])
 
 
 def parse_header(header_lines, start=2):
@@ -318,9 +336,513 @@ def plan_json(header, sha):
     return out
 
 
+def is_block_format(text):
+    if not text:
+        return False
+    first = text.lstrip("\ufeff").split("\n", 1)[0].strip()
+    return first.startswith("+++ ")
+
+
+def parse_blocks(text):
+    lines = text.split("\n")
+    blocks = []
+    seen_names = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        st = line.strip()
+        if st == "/+++" or st.startswith("/+++"):
+            raise Fail([f"line {i + 1}: stray '/+++' outside of any block"])
+        if st.startswith("+++ "):
+            m = re.match(r"^\+\+\+\s+([0-9.]+)\s+(.*?)(?:\s+\[toml\])?$", st)
+            if not m or not m.group(2).strip():
+                raise Fail([f"line {i + 1}: '+++ ' header does not match block pattern: '{line}'"])
+            num, name = m.group(1), m.group(2).strip()
+            name_norm = name.lower()
+            if name_norm in seen_names:
+                raise Fail([f"line {i + 1}: duplicate block name '{name}' (previously on line {seen_names[name_norm]})"])
+            seen_names[name_norm] = i + 1
+            is_toml = st.endswith("[toml]")
+            start_line = i + 1
+            b_lines = []
+            i += 1
+            while i < len(lines):
+                cur_st = lines[i].strip()
+                if cur_st == "/+++":
+                    break
+                if cur_st.startswith("+++ "):
+                    raise Fail([f"line {i + 1}: '+++ ' header before previous block closed with '/+++'"])
+                b_lines.append(lines[i])
+                i += 1
+            if i >= len(lines):
+                raise Fail([f"line {len(lines)}: missing '/+++' before end of file"])
+            close_line = i + 1
+            blocks.append({
+                "num": num,
+                "name": name,
+                "is_toml": is_toml,
+                "start_line": start_line,
+                "close_line": close_line,
+                "lines": b_lines,
+                "text": "\n".join(b_lines)
+            })
+        i += 1
+    return blocks
+
+
+def block_by_name(blocks, name):
+    name_norm = name.strip().lower()
+    for b in blocks:
+        if b.get("num", "").startswith("5.") or b.get("num") == "5":
+            continue
+        b_name = b["name"].strip().lower()
+        if b_name == name_norm:
+            return b
+    for b in blocks:
+        if b.get("num", "").startswith("5.") or b.get("num") == "5":
+            continue
+        b_name = b["name"].strip().lower()
+        if name_norm == "top block" and b_name.startswith("top block"):
+            return b
+        elif name_norm == "summary" and b_name.startswith("summary"):
+            return b
+        elif name_norm == "goal" and (b_name.startswith("goal") or b_name == "goals"):
+            return b
+        elif name_norm == "design / context" and (b_name.startswith("design") or "design" in b_name):
+            return b
+        elif name_norm == "gate settings" and b_name.startswith("gate settings"):
+            return b
+        elif name_norm == "gates" and (b_name == "gates" or b_name.startswith("gate")) and not b_name.startswith("gate settings"):
+            return b
+        elif name_norm == "risks" and (b_name.startswith("risk") or b_name == "risks"):
+            return b
+        elif name_norm == "open questions" and (b_name.startswith("open question") or b_name == "questions"):
+            return b
+        elif name_norm == "log" and b_name.startswith("log"):
+            return b
+    return None
+
+
+def _parse_toml_block(lines, start_line):
+    try:
+        clean = "\n".join(l[:-1] if l.endswith("\r") else l for l in lines)
+        return tomllib.loads(clean)
+    except tomllib.TOMLDecodeError as e:
+        rel = TOML_LINE_RE.search(str(e))
+        line = int(rel.group(1)) + start_line - 1 if rel else start_line
+        raise Fail([f"line {line}: {e}"])
+
+
+DASH_SEP = r"(?:\s*[—–]\s*|\s+-\s+)"
+
+
+def filter_block_lines(lines):
+    in_comment = False
+    for line in lines:
+        st = line.strip()
+        if not st:
+            continue
+        if in_comment:
+            if "-->" in st:
+                in_comment = False
+            continue
+        if "<!--" in st:
+            if "-->" not in st:
+                in_comment = True
+            continue
+        if st.startswith("#"):
+            continue
+        yield line, st
+
+
+def read_block_plan(text, sha=""):
+    blocks = parse_blocks(text)
+    by_num = {b["num"]: b for b in blocks}
+    warnings = []
+
+    # 1. Top block
+    b1 = block_by_name(blocks, "Top block")
+    top_toml = _parse_toml_block(b1["lines"], b1["start_line"]) if b1 else {}
+
+    # 2. Summary
+    b2 = block_by_name(blocks, "Summary")
+    summary = {"title": "", "phases": "", "method": "", "lanes": "", "delivery": "", "gates": "", "raw": []}
+    if b2:
+        summary["raw"] = list(b2["lines"])
+        for line in b2["lines"]:
+            st = line.strip()
+            if st.startswith("# "):
+                summary["title"] = st[2:].strip()
+                break
+        for line, st in filter_block_lines(b2["lines"]):
+            m = re.match(r"^\s*-\s*(Phases|Method|Lanes|Delivery|Gates)\s*:\s*(.*)$", line)
+            if m:
+                summary[m.group(1).lower()] = m.group(2).strip()
+
+    # 3. Goal
+    b3 = block_by_name(blocks, "Goal")
+    goals = []
+    goal_meta = {"why": "", "from": "", "sources": "", "raw": []}
+    if b3:
+        goal_meta["raw"] = list(b3["lines"])
+        for line, st in filter_block_lines(b3["lines"]):
+            m = re.match(r"^\s*-\s*(G\d+)" + DASH_SEP + r"(.*)$", line)
+            if m:
+                goals.append({"id": m.group(1), "text": m.group(2).strip(), "raw": line})
+                continue
+            m2 = re.match(r"^\s*-\s*(Why|From|Sources|Done when)\s*:\s*(.*)$", line, re.I)
+            if m2:
+                goal_meta[m2.group(1).lower()] = m2.group(2).strip()
+                continue
+            warnings.append(f"Goal block: line matches no pattern: {st!r}")
+
+    # 4. Design / context
+    b4 = block_by_name(blocks, "Design / context")
+    items = []
+    contracts, tests, assumptions, rollout, settings = [], [], [], [], []
+    if b4:
+        for line, st in filter_block_lines(b4["lines"]):
+            m = re.match(r"^\s*([CTARS]\d+)" + DASH_SEP + r"(.*)$", line)
+            if m:
+                item_id, item_text = m.group(1), m.group(2).strip()
+                prefix = item_id[0]
+                type_map = {"C": "contract", "T": "test", "A": "assumption", "R": "rollout", "S": "setting"}
+                itype = type_map.get(prefix, "item")
+                entry = {"id": item_id, "type": itype, "text": item_text, "raw": line}
+                items.append(entry)
+                if prefix == "C":
+                    contracts.append(entry)
+                elif prefix == "T":
+                    tests.append(entry)
+                elif prefix == "A":
+                    assumptions.append(entry)
+                elif prefix == "R":
+                    rollout.append(entry)
+                elif prefix == "S":
+                    settings.append(entry)
+
+    # 6. Gates & 6.0 Gate settings
+    b6 = block_by_name(blocks, "Gates")
+    b6_0 = block_by_name(blocks, "Gate settings")
+    toml_6_0 = _parse_toml_block(b6_0["lines"], b6_0["start_line"]) if b6_0 else {}
+    gate_timeout = int(toml_6_0.get("timeout", 600))
+    extra_gates = toml_6_0.get("extra", {})
+    if not isinstance(extra_gates, dict):
+        extra_gates = {}
+    if "use" in toml_6_0:
+        use_names = as_list(toml_6_0.get("use"))
+    else:
+        use_names = ["test", "typecheck"]
+
+    use_gates = [
+        {"id": g, "cmd": None, "use": True, "every": "run_end"}
+        for g in use_names
+        if g not in extra_gates
+    ]
+
+    proves_map = {}
+    gate_lines = []
+    if b6:
+        for line, st in filter_block_lines(b6["lines"]):
+            m = re.match(r"^\s*-\s*(\S+)" + DASH_SEP + r"proves\s*(.*?)" + DASH_SEP + r"(.*)$", line)
+            if m:
+                gname = m.group(1).strip()
+                gproves = [p.strip() for p in m.group(2).split(",") if p.strip()]
+                gtext = m.group(3).strip()
+                proves_map[gname] = gproves
+                gate_lines.append({
+                    "name": gname,
+                    "proves": gproves,
+                    "text": gtext,
+                    "raw": line,
+                })
+
+    # 5. Phases
+    phase_nums = []
+    for b in blocks:
+        m = re.match(r"^5\.(\d+)$", b["num"])
+        if m:
+            phase_nums.append((int(m.group(1)), b["num"]))
+    phase_nums.sort()
+
+    phases = []
+    raw_phases = []
+    all_task_ids = []
+    covers_map = {}
+    serves_map = {}
+
+    for p_int, p_num in phase_nums:
+        b_p = by_num.get(p_num)
+        b_p0 = by_num.get(f"{p_num}.0")
+        p_toml = _parse_toml_block(b_p0["lines"], b_p0["start_line"]) if b_p0 else {}
+
+        p_goal, p_serves, p_needs, p_build, p_hazards, p_carries = "", [], "", "", [], []
+        p_raw = list(b_p["lines"]) if b_p else []
+        if b_p:
+            for line, st in filter_block_lines(b_p["lines"]):
+                m = re.match(r"^\s*-\s*(Goal|Serves|Needs first|Build order|Hazards|Carries)\s*:\s*(.*)$", line)
+                if m:
+                    k, v = m.group(1), m.group(2).strip()
+                    if k == "Goal": p_goal = v
+                    elif k == "Serves": p_serves = [] if v.lower() == "none" else [x.strip() for x in v.split(",") if x.strip() and x.lower() != "none"]
+                    elif k == "Needs first": p_needs = v
+                    elif k == "Build order": p_build = v
+                    elif k == "Hazards": p_hazards = [] if v.lower() == "none" else [x.strip() for x in v.split(",") if x.strip() and x.lower() != "none"]
+                    elif k == "Carries": p_carries = [] if v.lower() == "none" else [x.strip() for x in v.split(",") if x.strip() and x.lower() != "none"]
+
+        pid = str(p_toml.get("id", ""))
+        serves_map[pid] = p_serves
+
+        task_nums = []
+        for b in blocks:
+            m = re.match(rf"^5\.{p_int}\.([1-9]\d*)$", b["num"])
+            if m:
+                task_nums.append((int(m.group(1)), b["num"]))
+        task_nums.sort()
+
+        tasks = []
+        raw_tasks = []
+        for t_int, t_num in task_nums:
+            b_t = by_num.get(t_num)
+            t_toml = _parse_toml_block(b_t["lines"], b_t["start_line"]) if b_t else {}
+            raw_tasks.append(dict(t_toml))
+            tid = str(t_toml.get("id", ""))
+            all_task_ids.append(tid)
+
+            t_covers = as_list(t_toml.get("covers"))
+            covers_map[tid] = t_covers
+
+            sub_nums = []
+            for b in blocks:
+                m = re.match(rf"^5\.{p_int}\.{t_int}\.([1-9]\d*)$", b["num"])
+                if m:
+                    sub_nums.append((int(m.group(1)), b["num"]))
+            sub_nums.sort()
+
+            subtasks = []
+            for s_int, s_num in sub_nums:
+                b_s = by_num.get(s_num)
+                s_toml = _parse_toml_block(b_s["lines"], b_s["start_line"]) if b_s else {}
+                sid = str(s_toml.get("id", ""))
+                s_acc_text, s_acc_lines = acceptance_lines_of(sid, s_toml.get("acceptance"))
+                subtasks.append({
+                    "id": sid,
+                    "title": s_toml.get("title", ""),
+                    "description": s_toml.get("description", ""),
+                    "acceptance": s_acc_text,
+                    "acceptance_lines": s_acc_lines,
+                    "deps": deps_list(s_toml.get("deps")),
+                    "parallel": parallel_of(s_toml),
+                    "route": route_of(s_toml),
+                    "owned": as_list(s_toml.get("owned")),
+                    "refs": as_list(s_toml.get("refs")),
+                })
+
+            t_acc_text, t_acc_lines = acceptance_lines_of(tid, t_toml.get("acceptance"))
+            raw_gate = t_toml.get("gate")
+            if isinstance(raw_gate, str) and raw_gate.strip():
+                t_gate = [{"cmd": raw_gate.strip(), "expect": 0, "timeout": gate_timeout, "lines": []}]
+            elif isinstance(raw_gate, list):
+                t_gate = gate_list_of(raw_gate)
+            else:
+                t_gate = []
+
+            task_obj = {
+                "id": tid,
+                "title": t_toml.get("title", ""),
+                "description": t_toml.get("description", ""),
+                "covers": t_covers,
+                "acceptance": t_acc_text,
+                "acceptance_lines": t_acc_lines,
+                "risk": t_toml.get("risk", 1),
+                "size": t_toml.get("size", p_toml.get("size", "standard")),
+                "gate": t_gate,
+                "manual": t_toml.get("manual", ""),
+                "deps": deps_list(t_toml.get("deps")),
+                "parallel": parallel_of(t_toml),
+                "route": route_of(t_toml),
+                "refs": as_list(t_toml.get("refs")),
+                "subagent": bool(t_toml.get("subagent", False)),
+                "owned": as_list(t_toml.get("owned")),
+                "subtasks": subtasks,
+            }
+            for k, v in t_toml.items():
+                if k not in task_obj and k != "critical":
+                    task_obj[k] = jsonable(v)
+            tasks.append(task_obj)
+
+        phase_obj = {
+            "id": pid,
+            "title": p_toml.get("title", ""),
+            "wave": p_toml.get("wave", 1),
+            "owned": as_list(p_toml.get("owned")),
+            "forbidden": as_list(p_toml.get("forbidden")),
+            "commit": p_toml.get("commit", ""),
+            "deps": deps_list(p_toml.get("deps")),
+            "route": route_of(p_toml),
+            "reviewer": p_toml.get("reviewer", ""),
+            "size": p_toml.get("size", "standard"),
+            "subagents": bool(p_toml["subagents"]) if "subagents" in p_toml else session_subagents(),
+            "lane_group": p_toml.get("lane_group", ""),
+            "qa": as_list(p_toml.get("qa")),
+            "parallel": parallel_of(p_toml),
+            "goal": p_goal,
+            "serves": p_serves,
+            "needs_first": p_needs,
+            "build_order": p_build,
+            "hazards": p_hazards,
+            "carries": p_carries,
+            "tasks": tasks,
+            "raw": p_raw,
+        }
+        for k, v in p_toml.items():
+            if k not in phase_obj and k not in ("risk", "review"):
+                phase_obj[k] = jsonable(v)
+        phases.append(phase_obj)
+
+        raw_phase = dict(p_toml)
+        raw_phase["task"] = raw_tasks
+        raw_phases.append(raw_phase)
+
+    final_gates = []
+    gates_dict = {}
+    for gname in use_names:
+        if gname not in extra_gates:
+            gates_dict[gname] = gname
+    for gname, cmd in extra_gates.items():
+        final_gates.append({
+            "id": gname,
+            "cmd": cmd,
+            "expect": 0,
+            "every": "run_end",
+            "timeout": gate_timeout,
+            "needs": [],
+            "covers": list(all_task_ids),
+            "proves": proves_map.get(gname, []),
+        })
+        gates_dict[gname] = {"cmd": cmd, "expect": 0, "timeout": gate_timeout}
+
+    # 7. Risks
+    b7 = block_by_name(blocks, "Risks")
+    risks = []
+    if b7:
+        for line, st in filter_block_lines(b7["lines"]):
+            if st.lower() == "none":
+                continue
+            m = re.match(r"^\s*-\s*(K\d+)" + DASH_SEP + r"(.*?)" + DASH_SEP + r"level\s*(\S+)" + DASH_SEP + r"guard:\s*(.*)$", line)
+            if m:
+                rest = m.group(4).strip()
+                m_gt = re.search(r"^(.*)" + DASH_SEP + r"(.*?)$", rest)
+                if m_gt:
+                    guard = m_gt.group(1).strip()
+                    target = m_gt.group(2).strip()
+                    targets = [t.strip() for t in target.split(",") if t.strip()]
+                    risks.append({
+                        "id": m.group(1),
+                        "what": m.group(2).strip(),
+                        "level": int(m.group(3)) if m.group(3).isdigit() else m.group(3),
+                        "guard": guard,
+                        "target": target,
+                        "targets": targets,
+                        "raw": line
+                    })
+                    continue
+            warnings.append(f"Risks block: line matches no pattern: {st!r}")
+
+    # 8. Open questions
+    b8 = block_by_name(blocks, "Open questions")
+    questions = []
+    if b8:
+        for line, st in filter_block_lines(b8["lines"]):
+            if st.lower() == "none":
+                continue
+            m = re.match(r"^\s*-\s*\[([ xX])\]\s*(Q\d+)" + DASH_SEP + r"(.*?)" + DASH_SEP + r"blocks:\s*(.*?)" + DASH_SEP + r"pick:\s*(.*)$", line)
+            if m:
+                raw_blocks = m.group(4).strip()
+                q_blocks = [] if raw_blocks.lower() == "none" else [b.strip() for b in raw_blocks.split(",") if b.strip() and b.lower() != "none"]
+                questions.append({
+                    "id": m.group(2),
+                    "ticked": m.group(1).lower() == "x",
+                    "question": m.group(3).strip(),
+                    "blocks": q_blocks,
+                    "pick": m.group(5).strip(),
+                    "raw": line
+                })
+                continue
+            warnings.append(f"Open questions block: line matches no pattern: {st!r}")
+
+    # 9. Log
+    b9 = block_by_name(blocks, "Log")
+    log = []
+    if b9:
+        for line, st in filter_block_lines(b9["lines"]):
+            if st.lower() == "none":
+                continue
+            m = re.match(r"^\s*-\s*(\S+)" + DASH_SEP + r"(.*?)" + DASH_SEP + r"(.*?)" + DASH_SEP + r"(\S+)\s*$", line)
+            if m:
+                log.append({
+                    "date": m.group(1),
+                    "kind": m.group(2).strip(),
+                    "text": m.group(3).strip(),
+                    "who": m.group(4).strip(),
+                    "raw": line
+                })
+                continue
+            warnings.append(f"Log block: line matches no pattern: {st!r}")
+
+    out = {
+        "ok": True,
+        "block_format": True,
+        "plan": str(top_toml.get("plan", "")),
+        "status": str(top_toml.get("status", "draft")),
+        "created": jsonable(top_toml.get("created", "")),
+        "runs": as_list(top_toml.get("runs")),
+        "sha": sha,
+        "pushed": bool(top_toml.get("pushed", False)),
+        "reviewer": str(top_toml.get("reviewer", "")),
+        "gates": gates_dict,
+        "use_gates": use_gates,
+        "final_gates": final_gates,
+        "gate_lines": gate_lines,
+        "use_names": use_names,
+        "extra_gates": extra_gates,
+        "phases": phases,
+        "goals": goals,
+        "goal_meta": goal_meta,
+        "items": items,
+        "contracts": contracts,
+        "tests": tests,
+        "assumptions": assumptions,
+        "rollout": rollout,
+        "settings": settings,
+        "risks": risks,
+        "questions": questions,
+        "log": log,
+        "summary": summary,
+        "serves": serves_map,
+        "covers": covers_map,
+        "proves": proves_map,
+        "warnings": warnings,
+        "has_block_6": bool(b6 or b6_0),
+    }
+    for k, v in top_toml.items():
+        if k not in out:
+            out[k] = jsonable(v)
+
+    header = dict(top_toml)
+    header["phase"] = raw_phases
+    header["gates"] = gates_dict
+    header["final_gate"] = final_gates
+    header["use_gates"] = use_gates
+
+    return header, out, sha
+
+
 def read_plan(path):
     """parse shared by parse/check/set/add-run: → (header dict, C2 dict, sha)."""
     text, sha = load(path)
+    if is_block_format(text):
+        return read_block_plan(text, sha)
     lines, close = split_plan(text)
     header = parse_header(lines[1:close])
     return header, plan_json(header, sha), sha
@@ -439,9 +961,13 @@ def header_parts(out):
     Phases body section."""
     phases = out["phases"]
     tasks = [t for p in phases for t in p["tasks"]]
+    if out.get("block_format"):
+        fg_ok = bool(out.get("gate_lines")) or is_template_plan(out)
+    else:
+        fg_ok = any(isinstance(g, dict) and g.get("covers") for g in out.get("final_gates") or [])
     return {"header phases": bool(phases), "tasks": bool(tasks),
             "acceptance": bool(tasks) and all(t["acceptance_lines"] for t in tasks),
-            "final gate": any(isinstance(g, dict) and g.get("covers") for g in out.get("final_gates") or [])}
+            "final gate": fg_ok}
 
 
 def classify(out, body):
@@ -506,17 +1032,427 @@ def summary_drift(out, body):
     return warnings
 
 
-def check_plan(header, out, body=None):
+def is_placeholder(v):
+    return isinstance(v, str) and v.startswith("<")
+
+
+def is_template_plan(out):
+    if out.get("plan") == "feature-id" or is_placeholder(out.get("plan")):
+        return True
+    phases = out.get("phases") or []
+    if phases and (is_placeholder(phases[0].get("title")) or phases[0].get("title") == "<what this phase delivers, one line>"):
+        return True
+    return False
+
+
+ALLOWED_LOG_KINDS = {
+    "drafted", "decision", "answer", "override", "scope cut",
+    "approved", "amended", "parked", "resumed"
+}
+
+
+def check_settings_limits(out, data=None, home=None):
+    """The approval-time warnings from CHECK.3:
+    - project settings not readable
+    - lanes in one wave exceed routing_preferences.max_build_lanes
+    - phase or task route names an agent that is not active (mk-catalog)
+    - use gate is not defined by the project
+    """
+    if is_template_plan(out):
+        return []
+    if not mk_config.project_settings_readable(data):
+        return ["project settings not readable"]
+
+    warnings = []
+    phases = out.get("phases") or []
+    use_gates = out.get("use_gates") or []
+
+    # 1. max_build_lanes
+    max_lanes = mk_config.max_build_lanes(data)
+    if max_lanes is not None:
+        waves = {}
+        for p in phases:
+            waves.setdefault(p.get("wave", 1), []).append(p)
+        for wave, group in sorted(waves.items()):
+            wave_distinct_lgs = {p["lane_group"] for p in group if p.get("lane_group")}
+            wave_no_lg = [p for p in group if not p.get("lane_group")]
+            wave_lanes = len(wave_distinct_lgs) + len(wave_no_lg)
+            if wave_lanes > max_lanes:
+                warnings.append(f"wave {wave} has {wave_lanes} lanes, exceeds max_build_lanes ({max_lanes})")
+
+    # 2. active agents
+    active = mk_config.active_agents(home)
+    if active is not None:
+        for p in phases:
+            if p.get("route"):
+                agent = p["route"].split()[0]
+                if agent not in active:
+                    warnings.append(f"phase {p.get('id')}: route names inactive agent {agent!r}")
+            for t in p.get("tasks", []):
+                if t.get("route"):
+                    agent = t["route"].split()[0]
+                    if agent not in active:
+                        warnings.append(f"task {t.get('id')}: route names inactive agent {agent!r}")
+                for s in t.get("subtasks", []):
+                    if s.get("route") and isinstance(s["route"], str) and s["route"].strip():
+                        agent = s["route"].split()[0]
+                        if agent not in active:
+                            warnings.append(f"subtask {s.get('id')}: route names inactive agent {agent!r}")
+
+    # 3. use gate defined by project
+    proj_gates = mk_config.project_gates(data)
+    if proj_gates is not None:
+        for g in use_gates:
+            gid = g.get("id")
+            if gid and not proj_gates.get(gid):
+                warnings.append(f"use gate {gid!r} is not defined by the project")
+
+    return warnings
+
+
+def run_start_check(out, data=None, home=None, raise_on_error=False):
+    """Turn the settings limit warnings into refusals at run start (phase RUN calls this)."""
+    refusals = check_settings_limits(out, data, home)
+    if raise_on_error and refusals:
+        raise Fail(refusals)
+    return refusals
+
+
+def check_block_plan_rules(header, out, errors, warnings, data=None, home=None):
+    """The new check rules for numbered-block plans (CHECK.2 and CHECK.3):
+    CHECK.2 (errors unless noted):
+    1. a goal no phase serves (error)
+    2. a goal no gate line proves (error)
+    3. a block-4 C/T/A/R id no task covers (error)
+    4. a task covering an id that does not exist (error)
+    5. a task covering more than 5 ids (error)
+    6. a risk whose named task has a lower risk than the risk's level (error)
+    7. a level>=3 risk whose guard names no gate and no T id (error)
+    8. a task at risk>=3 no risk line names (warning)
+    9. an unknown Log kind (error)
+    10. a Summary line whose value is off legend or disagrees with blocks 1/5/6 (warning)
+    CHECK.3 (warnings at approval):
+    11. phases in one wave exceed routing_preferences.max_build_lanes (warning)
+    12. a phase or task route names an agent that is not active (warning)
+    13. a use gate is not defined by the project (warning)
+    """
+    if is_template_plan(out):
+        return
+    phases = out.get("phases") or []
+    goals = out.get("goals") or []
+    items = out.get("items") or []
+    risks = out.get("risks") or []
+    questions = out.get("questions") or []
+    log = out.get("log") or []
+    gate_lines = out.get("gate_lines") or []
+    final_gates = out.get("final_gates") or []
+    use_gates = out.get("use_gates") or []
+    use_names = out.get("use_names", ["test", "typecheck"])
+    extra_gates = out.get("extra_gates", {})
+    use_extra_names = set(use_names) | set(extra_gates.keys())
+    tests = out.get("tests") or [it for it in items if it.get("id", "").startswith("T")]
+
+    # Block 6 gate lines
+    if out.get("has_block_6") and not gate_lines:
+        errors.append("block 6 has no gate lines")
+    if out.get("has_block_6"):
+        gate_line_names = {gl["name"] for gl in gate_lines if gl.get("name")}
+        if gate_line_names != use_extra_names:
+            warnings.append(f"block 6 gate lines ({', '.join(sorted(gate_line_names)) or 'none'}) "
+                            f"differ from use + [extra] ({', '.join(sorted(use_extra_names)) or 'none'})")
+
+    # 1. a goal no phase serves (error)
+    all_served = {gid for p in phases for gid in (p.get("serves") or []) if gid}
+    for g in goals:
+        gid = g.get("id")
+        text = g.get("text", "")
+        if not gid or is_placeholder(text) or is_placeholder(gid):
+            continue
+        if gid not in all_served:
+            errors.append(f"goal {gid} is served by no phase")
+
+    # 2. a goal no gate line proves (error)
+    # A goal counts as proved only by a gate line whose name is in use + [extra]
+    all_proved = {gid for gl in gate_lines if gl.get("name") in use_extra_names for gid in gl.get("proves", []) if gid}
+    for g in goals:
+        gid = g.get("id")
+        text = g.get("text", "")
+        if not gid or is_placeholder(text) or is_placeholder(gid):
+            continue
+        if gid not in all_proved:
+            errors.append(f"goal {gid} is proved by no gate line")
+
+    # 3. a block-4 C/T/A/R id no task covers (error)
+    all_task_covered = {cid for p in phases for t in p.get("tasks", []) for cid in (t.get("covers") or []) if cid}
+    for it in items:
+        iid = it.get("id", "")
+        if not iid or iid[0] not in ("C", "T", "A", "R"):
+            continue
+        text = it.get("text", "")
+        if is_placeholder(text) or is_placeholder(iid):
+            continue
+        if iid not in all_task_covered:
+            errors.append(f"block 4 item {iid} is covered by no task")
+
+    # 4. a task covering an id that does not exist (error)
+    # 5. a task covering more than 5 ids (error)
+    all_block4_ids = {it.get("id") for it in items if it.get("id")}
+    for p in phases:
+        for t in p.get("tasks", []):
+            tid = t.get("id") or "task"
+            covers = t.get("covers") or []
+            if len(covers) > 5:
+                errors.append(f"{tid}: covers {len(covers)} ids (max 5)")
+            for cid in covers:
+                if is_placeholder(cid):
+                    continue
+                if cid not in all_block4_ids:
+                    errors.append(f"{tid}: covers {cid!r} which does not exist in block 4")
+
+    # 6. a risk whose named task has a lower risk than the risk's level (error)
+    # 7. a level>=3 risk whose guard names no gate and no T id (error)
+    task_by_id = {t["id"]: t for p in phases for t in p.get("tasks", []) if t.get("id")}
+    phase_by_id = {p["id"]: p for p in phases if p.get("id")}
+    block4_t_ids = {it["id"] for it in items if it.get("id") and it["id"].startswith("T")}
+
+    for r in risks:
+        rid = r.get("id") or "risk"
+        lvl = r.get("level")
+        raw_target = r.get("target", "").strip()
+        guard = r.get("guard", "").strip()
+        if is_placeholder(raw_target) or is_placeholder(guard):
+            continue
+        targets = r.get("targets") or [t.strip() for t in raw_target.split(",") if t.strip()]
+        for tgt in targets:
+            if is_placeholder(tgt):
+                continue
+            if tgt in task_by_id:
+                t_risk = task_by_id[tgt].get("risk", 1)
+                if isinstance(lvl, int) and t_risk < lvl:
+                    errors.append(f"risk {rid}: task {tgt} risk ({t_risk}) is lower than risk level ({lvl})")
+            elif tgt in phase_by_id:
+                p_tasks = phase_by_id[tgt].get("tasks", [])
+                max_risk = max((t.get("risk", 1) for t in p_tasks), default=1)
+                if isinstance(lvl, int) and max_risk < lvl:
+                    errors.append(f"risk {rid}: phase {tgt} riskiest task ({max_risk}) is lower than risk level ({lvl})")
+            else:
+                errors.append(f"risk {rid}: target {tgt!r} is neither a task nor a phase")
+
+        # 7. level >= 3 guard check
+        # pass only when the guard names a T id that exists in block 4,
+        # or a gate name from use/[extra], or the target task has its own gate.
+        # Bare words like "test" or "gate" do not count.
+        if isinstance(lvl, int) and lvl >= 3:
+            has_t = any(re.search(r"\b" + re.escape(tid) + r"\b", guard) for tid in block4_t_ids if tid)
+            has_gate_name = any(re.search(r"\b" + re.escape(gn) + r"\b", guard) for gn in use_extra_names if gn)
+            task_has_gate = any(bool(task_by_id[tgt].get("gate")) for tgt in targets if tgt in task_by_id)
+            has_task_gate = bool(re.search(r"\bgate\b", guard, re.I)) and task_has_gate
+            if not (has_t or has_gate_name or has_task_gate):
+                errors.append(f"risk {rid}: level {lvl} risk guard {guard!r} names no gate and no T id")
+
+    # 8. a task at risk>=3 no risk line names (warning)
+    risk_targets = {tgt for r in risks for tgt in (r.get("targets") or [t.strip() for t in r.get("target", "").split(",") if t.strip()]) if tgt}
+    for p in phases:
+        for t in p.get("tasks", []):
+            tid = t.get("id")
+            t_risk = t.get("risk", 1)
+            if isinstance(t_risk, int) and t_risk >= 3:
+                if is_template_plan(out) or is_placeholder(t.get("title")) or is_placeholder(tid):
+                    continue
+                if tid not in risk_targets and p.get("id") not in risk_targets:
+                    warnings.append(f"task {tid}: risk {t_risk} >= 3 is named by no risk line")
+
+    # 9. an unknown Log kind (error)
+    for entry in log:
+        kind = entry.get("kind", "").strip()
+        if is_placeholder(kind):
+            continue
+        if kind not in ALLOWED_LOG_KINDS:
+            errors.append(f"log: unknown kind {kind!r} (allowed: {', '.join(sorted(ALLOWED_LOG_KINDS))})")
+
+    # 10. Summary line checks (warning)
+    sum_dict = out.get("summary") or {}
+    raw_phases_sum = sum_dict.get("phases", "").strip()
+    if raw_phases_sum and not raw_phases_sum.startswith("<"):
+        m_ph = re.match(r"^(\d+)" + DASH_SEP + r"(.*)$", raw_phases_sum)
+        if not m_ph:
+            warnings.append(f"Summary Phases value off legend: {raw_phases_sum!r}")
+        else:
+            cnt = int(m_ph.group(1))
+            if cnt != len(phases):
+                warnings.append(f"Summary says {cnt} phases; the plan has {len(phases)}")
+            rest = m_ph.group(2)
+            entries = [e.strip() for e in rest.split(";") if e.strip()]
+            phases_summary_map = {}
+            for e in entries:
+                m_ent = re.match(r"^(\S+)\s*:\s*(.*)$", e)
+                if m_ent:
+                    phases_summary_map[m_ent.group(1).strip()] = m_ent.group(2).strip()
+            for p in phases:
+                pid = p.get("id")
+                if not pid:
+                    continue
+                if pid not in phases_summary_map and not re.search(r"(?<![\w-])" + re.escape(pid) + r"(?![\w-])", rest):
+                    warnings.append(f"Summary Phases does not list phase {pid}")
+                elif pid in phases_summary_map:
+                    got_title = phases_summary_map[pid]
+                    exp_title = p.get("title", "").strip()
+                    if got_title != exp_title:
+                        warnings.append(f"Summary Phases phase {pid} title says {got_title!r}; block 5 says {exp_title!r}")
+
+    raw_meth = sum_dict.get("method", "").strip()
+    if raw_meth and not raw_meth.startswith("<"):
+        m_meth = re.match(r"^(waves|single lane)\s*·\s*subagents\s+(on|off|mixed)$", raw_meth, re.I)
+        if not m_meth:
+            warnings.append(f"Summary Method value off legend: {raw_meth!r}")
+        elif phases:
+            distinct_lgs = {p["lane_group"] for p in phases if p.get("lane_group")}
+            no_lg = [p for p in phases if not p.get("lane_group")]
+            total_lanes = len(distinct_lgs) + len(no_lg)
+            waves_exp = "single lane" if total_lanes <= 1 else "waves"
+            subs_exp_set = {bool(p.get("subagents")) for p in phases}
+            subs_exp = "mixed" if len(subs_exp_set) > 1 else ("on" if True in subs_exp_set else "off")
+            got_waves = m_meth.group(1).lower()
+            got_subs = m_meth.group(2).lower()
+            if (got_waves, got_subs) != (waves_exp, subs_exp):
+                warnings.append(f"Summary Method says {got_waves} · subagents {got_subs}; "
+                                f"the plan says {waves_exp} · subagents {subs_exp}")
+
+    raw_lanes = sum_dict.get("lanes", "").strip()
+    if raw_lanes and not raw_lanes.startswith("<"):
+        lane_entries = [e.strip() for e in raw_lanes.split(";") if e.strip()]
+        lg_map = {}
+        for le in lane_entries:
+            m_lg = re.match(r"^(\S+)\s*:\s*(.*)$", le)
+            if m_lg:
+                members = [m.strip() for m in m_lg.group(2).split(",") if m.strip()]
+                lg_map[m_lg.group(1).strip()] = members
+
+        for g in sorted({p["lane_group"] for p in phases if p.get("lane_group")}):
+            exp_members = [p["id"] for p in phases if p.get("lane_group") == g]
+            if g not in lg_map:
+                warnings.append(f"Summary Lanes does not name lane_group {g}")
+            else:
+                got_members = lg_map[g]
+                if set(got_members) != set(exp_members):
+                    warnings.append(f"Summary Lanes lane_group {g} members ({', '.join(sorted(got_members))}) "
+                                    f"do not match plan ({', '.join(sorted(exp_members))})")
+        for p in phases:
+            pid = p.get("id")
+            if pid and not p.get("lane_group"):
+                if not re.search(r"(?<![\w-])" + re.escape(pid) + r"(?![\w-])", raw_lanes):
+                    warnings.append(f"Summary Lanes does not list phase {pid}")
+
+    raw_deliv = sum_dict.get("delivery", "").strip()
+    if raw_deliv and not raw_deliv.startswith("<"):
+        m_deliv = re.match(r"^(.*?)\s*·\s*pushed:\s*(yes|no)$", raw_deliv, re.I)
+        if not m_deliv:
+            warnings.append(f"Summary Delivery value off legend: {raw_deliv!r}")
+        else:
+            branch = m_deliv.group(1).strip()
+            pushed_str = m_deliv.group(2).lower()
+            default_branch = mk_config.integration_branch(data)
+            exp_branch = str(out.get("integration") or default_branch)
+            exp_pushed = "yes" if out.get("pushed") else "no"
+            if branch != exp_branch:
+                warnings.append(f"Summary Delivery branch says {branch!r}; block 1 says {exp_branch!r}")
+            if pushed_str != exp_pushed:
+                warnings.append(f"Summary Delivery pushed says {pushed_str!r}; block 1 says {exp_pushed!r}")
+
+    raw_gates = sum_dict.get("gates", "").strip()
+    if raw_gates and not raw_gates.startswith("<"):
+        for un in use_names:
+            if not re.search(r"(?<![\w-])" + re.escape(un) + r"(?![\w-])", raw_gates):
+                warnings.append(f"Summary Gates does not list use gate {un}")
+        for fg in final_gates:
+            fid = fg.get("id")
+            if fid and not re.search(r"(?<![\w-])" + re.escape(fid) + r"(?![\w-])", raw_gates):
+                warnings.append(f"Summary Gates does not list extra gate {fid}")
+
+    # Template link rules (warnings)
+    # 1. Carries equals union of tasks' covers
+    for p in phases:
+        pid = p.get("id") or "phase"
+        p_carries = set(p.get("carries") or [])
+        tasks_covers = {cid for t in p.get("tasks", []) for cid in (t.get("covers") or []) if cid and not is_placeholder(cid)}
+        p_carries_clean = {c for c in p_carries if not is_placeholder(c)}
+        if p_carries_clean != tasks_covers:
+            warnings.append(f"phase {pid}: Carries ({', '.join(sorted(p_carries_clean)) or 'none'}) "
+                            f"does not match tasks' covers ({', '.join(sorted(tasks_covers)) or 'none'})")
+
+    # 2. Needs first must match deps
+    all_other_phase_ids = {ph["id"] for ph in phases if ph.get("id")}
+    for p in phases:
+        pid = p.get("id") or "phase"
+        p_deps = p.get("deps") or []
+        needs_first = (p.get("needs_first") or "").strip()
+        if not needs_first or is_placeholder(needs_first):
+            continue
+        mentioned_phases = {ph_id for ph_id in (all_other_phase_ids - {pid}) if re.search(r"\b" + re.escape(ph_id) + r"\b", needs_first)}
+        if p_deps:
+            for dep in p_deps:
+                if not re.search(r"\b" + re.escape(dep) + r"\b", needs_first):
+                    warnings.append(f"phase {pid}: Needs first does not mention dep {dep!r}")
+            for ph_id in mentioned_phases:
+                if ph_id not in p_deps:
+                    warnings.append(f"phase {pid}: Needs first mentions {ph_id!r} which is not in deps")
+        else:
+            if mentioned_phases:
+                warnings.append(f"phase {pid}: Needs first mentions {', '.join(sorted(mentioned_phases))} but deps is empty")
+            elif not ("nothing" in needs_first.lower() or "none" in needs_first.lower()):
+                warnings.append(f"phase {pid}: deps is empty but Needs first does not state 'nothing'")
+
+    # 3. Test plan "written by <task>" must match that task's covers
+    for t_item in tests:
+        tid = t_item.get("id")
+        text = t_item.get("text", "")
+        m_wb = re.search(r"\bwritten by\s+(\S+)", text, re.I)
+        if m_wb:
+            writer_task = m_wb.group(1).rstrip(",.;")
+            if not is_placeholder(writer_task):
+                t_obj = task_by_id.get(writer_task)
+                if t_obj:
+                    t_covers = t_obj.get("covers") or []
+                    if tid not in t_covers:
+                        warnings.append(f"test {tid} written by {writer_task}, but {writer_task} covers does not list {tid}")
+
+    # 4. Unknown IDs: G in Serves, K in Hazards, id in question's blocks:
+    all_goal_ids = {g["id"] for g in goals if g.get("id")}
+    all_risk_ids = {r["id"] for r in risks if r.get("id")}
+    all_blockable_ids = set(phase_by_id.keys()) | set(task_by_id.keys())
+    for p in phases:
+        pid = p.get("id") or "phase"
+        for gid in (p.get("serves") or []):
+            if gid and not is_placeholder(gid) and gid not in all_goal_ids:
+                warnings.append(f"phase {pid}: Serves lists unknown goal {gid!r}")
+        for kid in (p.get("hazards") or []):
+            if kid and not is_placeholder(kid) and kid not in all_risk_ids:
+                warnings.append(f"phase {pid}: Hazards lists unknown risk {kid!r}")
+    for q in questions:
+        qid = q.get("id") or "question"
+        for bid in (q.get("blocks") or []):
+            if bid and not is_placeholder(bid) and bid not in all_blockable_ids:
+                warnings.append(f"question {qid}: blocks lists unknown phase or task {bid!r}")
+
+    # CHECK.3 limits warnings
+    limit_warns = check_settings_limits(out, data, home)
+    warnings.extend(limit_warns)
+
+
+def check_plan(header, out, body=None, data=None, home=None):
     """→ (errors, warnings). Errors are exactly the P1.2 contract rules; anything
     advisory (cross-run deps, malformed id shapes) is a warning. `body` is the markdown
     below the closing +++ when the caller has it: the T1 header-key gaps are warnings
     there too, so a plan written before the key existed still checks ok."""
-    errors, warnings = [], []
+    errors, warnings = [], list(out.get("warnings") or [])
     phases = out["phases"]
     raw = as_list(header.get("phase"))
 
     if str(out["plan"]) and not PLAN_ID_RE.fullmatch(str(out["plan"])):
-        warnings.append(f"plan id {out['plan']!r} does not match [a-z0-9][a-z0-9-]{{0,40}}")
+        if not is_placeholder(out["plan"]):
+            warnings.append(f"plan id {out['plan']!r} does not match [a-z0-9][a-z0-9-]{{0,40}}")
+    if _mkdb().is_bugs_run(str(out["plan"])):
+        errors.append(RESERVED_PLAN_ERR)
 
     # F.0 gate shape: a plain string gate is manual (never run, never blocks), a
     # [gates.<name>] table is runnable. Only its shape is checked here — running it is the
@@ -550,13 +1486,13 @@ def check_plan(header, out, body=None):
                         "D1, header_json until then) — the date the plan was drafted")
     if body is not None and not has_h1(body):
         warnings.append("body has no H1 line; the first '# ' line is what becomes plans.title")
-    if not str(header.get("description") or "").strip():
+    if not out.get("block_format") and not str(header.get("description") or "").strip():
         warnings.append("no description key in the header; advised: two to five plain sentences "
                         "(plans.header_json only)")
     # TPL.2: a plan created on or after NEW_PLAN_FROM gets the REQUIRED keys as errors; an older or
     # undated plan only a warning
     strict = errors if is_new_plan(header) else warnings
-    if body is not None:
+    if body is not None and not out.get("block_format"):
         secs = body_sections(body)
         for name in ("Summary", "Goal"):
             if not secs[name]:
@@ -584,7 +1520,7 @@ def check_plan(header, out, body=None):
         for key in ("title", "wave", "owned", "commit"):
             if key not in rp:
                 strict.append(f"{pid}: no {key} key (required in a plan created on or after {NEW_PLAN_FROM})")
-        if not str(rp.get("description") or "").strip():
+        if not out.get("block_format") and not str(rp.get("description") or "").strip():
             warnings.append(f"{pid}: no description; advised: two to five plain sentences")
         w = raw[n].get("wave", 1) if n < len(raw) else 1
         if not isinstance(w, int) or isinstance(w, bool) or w < 1:
@@ -603,9 +1539,9 @@ def check_plan(header, out, body=None):
                 errors.append(f"{pid}: unknown dep {d}")
         if p["size"] not in SIZES:
             errors.append(f"{pid}: bad size {p['size']!r} ({'|'.join(SIZES)})")
-        if p["risk"] not in RISKS:
+        if "risk" in p and p["risk"] not in RISKS:
             errors.append(f"{pid}: bad risk {p['risk']!r} ({'|'.join(RISKS)})")
-        if p["review"] not in REVIEWS:
+        if "review" in p and p["review"] not in REVIEWS:
             errors.append(f"{pid}: bad review {p['review']!r} ({'|'.join(REVIEWS)})")
         if p["route"] != "" and not ROUTE_RE.fullmatch(str(p["route"])):
             errors.append(f'{pid}: bad route {p["route"]!r} ("" or "<agent> <model> [<effort>]")')
@@ -621,7 +1557,7 @@ def check_plan(header, out, body=None):
                 strict.append(f"{tid}: no title key (required in a plan created on or after {NEW_PLAN_FROM})")
             if not t["acceptance_lines"]:
                 warnings.append(f"{tid}: no acceptance")
-            elif any(isinstance(g, dict) for g in t["gate"]):
+            elif not out.get("block_format") and any(isinstance(g, dict) for g in t["gate"]):
                 proved = {str(x) for g in t["gate"] if isinstance(g, dict) and isinstance(g.get("lines"), list)
                           for x in g["lines"]}
                 loose = [ln["id"] for ln in t["acceptance_lines"] if ln["id"] not in proved]
@@ -652,26 +1588,6 @@ def check_plan(header, out, body=None):
                 if clash:
                     errors.append(f"{pid}: subagent tasks {subs[i]['id']} and {subs[j]['id']} share a file ({clash})")
 
-    waves = {}
-    for p in phases:
-        waves.setdefault(p["wave"], []).append(p)
-    for wave in sorted(waves):
-        group = waves[wave]
-        for i in range(len(group)):
-            for j in range(i + 1, len(group)):
-                clash = owned_clash(group[i]["owned"], group[j]["owned"])
-                if clash:
-                    errors.append(f"wave {wave}: {group[i]['id']} and {group[j]['id']} both own {clash}")
-
-    lanes = {}
-    for p in phases:
-        if p["lane_group"]:
-            lanes.setdefault(p["lane_group"], []).append(p)
-    for g, group in sorted(lanes.items()):
-        ws = sorted({p["wave"] for p in group})
-        if len(ws) > 1:
-            errors.append(f"lane_group {g}: phases in different waves ({', '.join(str(w) for w in ws)})")
-
     # same graph validate_tree walks: phases, tasks and subtasks, keyed by id.
     # a cross-run dep (<run>:<id>) is not an edge here — check cannot see the other run —
     # and stays the warning recorded above. a self-dep is its own one-node cycle.
@@ -689,7 +1605,48 @@ def check_plan(header, out, body=None):
     cycle = find_cycle(nodes)
     if cycle:
         errors.append("dep cycle: " + " -> ".join(cycle))
+
+    def has_dep_path(start, target):
+        visited = set()
+        queue = [start]
+        while queue:
+            curr = queue.pop(0)
+            if curr == target:
+                return True
+            if curr in visited:
+                continue
+            visited.add(curr)
+            for dep in nodes.get(curr, []):
+                if dep not in visited:
+                    queue.append(dep)
+        return False
+
+    waves = {}
+    for p in phases:
+        waves.setdefault(p["wave"], []).append(p)
+    for wave in sorted(waves):
+        group = waves[wave]
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                # Q8: if one phase depends on the other, the dependency orders them
+                if has_dep_path(group[j]["id"], group[i]["id"]) or has_dep_path(group[i]["id"], group[j]["id"]):
+                    continue
+                clash = owned_clash(group[i]["owned"], group[j]["owned"])
+                if clash:
+                    errors.append(f"wave {wave}: {group[i]['id']} and {group[j]['id']} both own {clash}")
+
+    lanes = {}
+    for p in phases:
+        if p["lane_group"]:
+            lanes.setdefault(p["lane_group"], []).append(p)
+    for g, group in sorted(lanes.items()):
+        ws = sorted({p["wave"] for p in group})
+        if len(ws) > 1:
+            errors.append(f"lane_group {g}: phases in different waves ({', '.join(str(w) for w in ws)})")
+
     check_gate_fields(out, errors, warnings)
+    if out.get("block_format"):
+        check_block_plan_rules(header, out, errors, warnings, data=data, home=home)
     return errors, warnings
 
 
@@ -711,12 +1668,19 @@ def check_gate_fields(out, errors, warnings):
     task_ids = [tid for t, tid in items if tid]
     for t, tid in items:
         rid = tid or "task"
+        risk = t.get("risk", 1)
         gates = t.get("gate") or []
         manual = t.get("manual", "")
         if gates and manual:
             errors.append(f"{rid}: gate and manual are exclusive; pick one")
+        elif out.get("block_format") and risk == 5 and not gates:
+            errors.append(f"{rid}: risk 5 requires a gate command")
         elif not gates and not manual:
-            warnings.append(f"{rid}: neither gate nor manual line")
+            if not out.get("block_format"):
+                warnings.append(f"{rid}: neither gate nor manual line")
+            else:
+                if risk >= 3:
+                    errors.append(f"{rid}: risk {risk} requires a gate or manual")
         lines = {ln["id"] for ln in t.get("acceptance_lines") or []}
         for i, g in enumerate(gates):
             glabel = f"{tid} gate" if len(gates) == 1 else f"{rid} gate {i + 1}"
@@ -737,7 +1701,6 @@ def check_gate_fields(out, errors, warnings):
             for lid in glines:
                 if str(lid) not in lines:
                     errors.append(f"{glabel}: lines id {lid!r} is not an acceptance line of {rid}")
-        risk = t.get("risk", 1)
         if type(risk) is not int or isinstance(risk, bool) or not 1 <= risk <= 5:
             errors.append(f"{rid}: risk {risk!r} is not an int 1-5")
     # F.2 header [[final_gate]] blocks. F.0's [gates] tables and string gates are checked above,
@@ -764,8 +1727,9 @@ def check_gate_fields(out, errors, warnings):
         for cid in covers:
             if str(cid) not in task_ids:
                 errors.append(f"{label}: covers {cid!r} is not a task in this plan")
-    if not finals:
-        warnings.append("no final_gate in the plan: F.2 wants one plan-level gate with covers")
+    if not out.get("block_format"):
+        if not finals:
+            warnings.append("no final_gate in the plan: F.2 wants one plan-level gate with covers")
 
 
 # ---------- set / add-run (P1.3): rewrite only the key's line(s) ----------
@@ -942,14 +1906,15 @@ def cmd_parse(a):
 def cmd_check(a):
     if a.classify:  # a file with no +++ first line is a class (not_a_plan), not an error
         text, sha = load(a.path)
-        if text.lstrip("﻿").split("\n", 1)[0].strip() != "+++":
+        first = text.lstrip("\ufeff").split("\n", 1)[0].strip()
+        if first != "+++" and not first.startswith("+++ "):
             return {"ok": True, "plan": "", "sha": sha, "warnings": [],
                     **classify({"phases": [], "final_gates": []}, text)}
     header, out, _ = read_plan(a.path)
     text, _ = load(a.path)
     _lines, close = split_plan(text)
     body = body_md_of(text, close)
-    errors, warnings = check_plan(header, out, body)
+    errors, warnings = check_plan(header, out, body, data=a.data, home=a.home)
     cls = classify(out, body)
     if errors:
         raise Fail(errors, warnings=warnings, **(cls if a.classify else {}))
@@ -1149,6 +2114,138 @@ def cmd_item_set(a):
                                                               "owned", "deps")}, a.data, a.home)
 
 
+def log_plan(plan, kind, text, who, data=None, home=None, date=None):
+    """STORE.2: append a Log line to the plan's log in the store (header_json).
+    The approved version file under archive/ is never changed."""
+    if not plan:
+        raise Fail(["plan id required"])
+    if not kind or not str(kind).strip():
+        raise Fail(["log needs non-empty --kind"])
+    kind = str(kind).strip()
+    if kind not in ALLOWED_LOG_KINDS:
+        raise Fail([f"log: unknown kind {kind!r} (allowed: {', '.join(sorted(ALLOWED_LOG_KINDS))})"])
+    if not text or not str(text).strip():
+        raise Fail(["log needs non-empty --text"])
+    text = str(text).strip()
+    if not who or not str(who).strip():
+        raise Fail(["log needs non-empty --by"])
+    who = str(who).strip()
+    held = plan_in_store(plan, data, home)
+    if held is None:
+        raise Fail([f"no plan {plan} in the store"])
+    db, con, plan_id, row = held
+    try:
+        header = header_of(row)
+        today = date or datetime.date.today().isoformat()
+        entry = {"date": today, "kind": kind, "text": text, "who": who,
+                 "raw": f"- {today} — {kind} — {text} — {who}"}
+        header.setdefault("log", []).append(entry)
+        con.execute("UPDATE plans SET header_json=? WHERE id=?",
+                    (json.dumps(header, sort_keys=True), plan_id))
+        con.commit()
+    finally:
+        con.close()
+    return {"ok": True, "plan": plan_id, "store": True, "log": entry}
+
+
+def answer_plan(plan, question, text, who, data=None, home=None, date=None):
+    """STORE.2: tick a question and record the answer in the store (header_json).
+    Also appends a Log line. The approved version file under archive/ is never changed."""
+    if not plan:
+        raise Fail(["plan id required"])
+    if not question or not str(question).strip():
+        raise Fail(["answer needs a question id (e.g. Q1)"])
+    qid = str(question).strip()
+    if not qid.startswith("Q") and qid.isdigit():
+        qid = f"Q{qid}"
+    if not who or not str(who).strip():
+        raise Fail(["answer needs non-empty --by"])
+    who = str(who).strip()
+    text = (text or "").strip()
+    held = plan_in_store(plan, data, home)
+    if held is None:
+        raise Fail([f"no plan {plan} in the store"])
+    db, con, plan_id, row = held
+    try:
+        header = header_of(row)
+        questions = header.setdefault("questions", [])
+        q_match = next((q for q in questions if q.get("id") == qid), None)
+        if not q_match:
+            raise Fail([f"no question {qid} in plan {plan_id}"])
+        q_match["ticked"] = True
+        if text:
+            q_match["pick"] = text
+            q_match["answer"] = text
+        q_match["answered_by"] = who
+        today = date or datetime.date.today().isoformat()
+        log_text = f"{qid}: {text}" if text else qid
+        entry = {"date": today, "kind": "answer", "text": log_text, "who": who,
+                 "raw": f"- {today} — answer — {log_text} — {who}"}
+        header.setdefault("log", []).append(entry)
+        con.execute("UPDATE plans SET header_json=? WHERE id=?",
+                    (json.dumps(header, sort_keys=True), plan_id))
+        con.commit()
+    finally:
+        con.close()
+    return {"ok": True, "plan": plan_id, "question": qid, "store": True, "log": entry}
+
+
+def override_plan(plan, question, task, who, text="", data=None, home=None, date=None):
+    """STORE.2: record an override for a question on a task in the store (header_json).
+    Also appends a Log line. The approved version file under archive/ is never changed."""
+    if not plan:
+        raise Fail(["plan id required"])
+    if not question or not str(question).strip():
+        raise Fail(["override needs a question id (e.g. Q1)"])
+    qid = str(question).strip()
+    if not qid.startswith("Q") and qid.isdigit():
+        qid = f"Q{qid}"
+    if not task or not str(task).strip():
+        raise Fail(["override needs non-empty --task"])
+    task = str(task).strip()
+    if not who or not str(who).strip():
+        raise Fail(["override needs non-empty --by"])
+    who = str(who).strip()
+    text = (text or "").strip()
+    held = plan_in_store(plan, data, home)
+    if held is None:
+        raise Fail([f"no plan {plan} in the store"])
+    db, con, plan_id, row = held
+    try:
+        header = header_of(row)
+        questions = header.setdefault("questions", [])
+        q_match = next((q for q in questions if q.get("id") == qid), None)
+        if not q_match:
+            raise Fail([f"no question {qid} in plan {plan_id}"])
+        today = date or datetime.date.today().isoformat()
+        ovr = {"question": qid, "task": task, "by": who, "date": today, "text": text}
+        header.setdefault("overrides", []).append(ovr)
+        q_match.setdefault("overrides", []).append(task)
+        log_text = f"{qid} for {task}" + (f": {text}" if text else "")
+        entry = {"date": today, "kind": "override", "text": log_text, "who": who,
+                 "raw": f"- {today} — override — {log_text} — {who}"}
+        header.setdefault("log", []).append(entry)
+        con.execute("UPDATE plans SET header_json=? WHERE id=?",
+                    (json.dumps(header, sort_keys=True), plan_id))
+        con.commit()
+    finally:
+        con.close()
+    return {"ok": True, "plan": plan_id, "question": qid, "task": task, "store": True,
+            "override": ovr, "log": entry}
+
+
+def cmd_log(a):
+    return log_plan(a.plan, a.kind, a.text, a.by, a.data, a.home, getattr(a, "date", None))
+
+
+def cmd_answer(a):
+    return answer_plan(a.plan, a.question, a.text, a.by, a.data, a.home, getattr(a, "date", None))
+
+
+def cmd_override(a):
+    return override_plan(a.plan, a.question, a.task, a.by, a.text, a.data, a.home, getattr(a, "date", None))
+
+
 # ---------- approve / export (D4): the store is optional ----------
 
 def _mkdb():
@@ -1294,12 +2391,22 @@ def header_json_of(out, sha, body_md, status):
     """The header_json approve and import both write: the sha of the file, the status, runs,
     gates, the F.2 final gates, phases and the body, plus the plan-level `description` when it
     is a non-empty string. Other unknown header keys (created, design, integration, …) live
-    here on a store without the D1.1 columns."""
+    here on a store without the D1.1 columns.
+    For numbered-block plans (STORE.1 / C2), also writes goals, items, risks, questions, log,
+    summary, gate_lines, use_gates, pushed, integration."""
     hdr = {"sha": sha, "status": status, "runs": out["runs"], "gates": out["gates"],
            "final_gates": out["final_gates"], "phases": out["phases"], "body": body_md}
     desc = out.get("description")
     if isinstance(desc, str) and desc.strip():
         hdr["description"] = desc
+    # New fields (STORE.1 / C2)
+    for k in ("goals", "items", "risks", "questions", "log", "summary", "gate_lines", "use_gates", "proves"):
+        if k in out and out[k] is not None:
+            hdr[k] = out[k]
+    if "pushed" in out and out["pushed"] is not None:
+        hdr["pushed"] = bool(out["pushed"])
+    if "integration" in out and out["integration"] is not None:
+        hdr["integration"] = out["integration"]
     return json.dumps(hdr, sort_keys=True)
 
 
@@ -1424,6 +2531,8 @@ def merged_header_json(out, sha, body_md, status, prev_header, source=None):
     src = source or prev_header.get("source")
     if src:
         hdr["source"] = src
+    if "overrides" in prev_header and "overrides" not in hdr:
+        hdr["overrides"] = prev_header["overrides"]
     return json.dumps(hdr, sort_keys=True)
 
 
@@ -1559,11 +2668,14 @@ def approve_file(path, data, home, run, user_ack=None):
     skill."""
     data = resolve_data_arg(data)
     header, out, sha = read_plan(path)
-    errors, warnings = check_plan(header, out)
+    errors, warnings = check_plan(header, out, data=data, home=home)
     if errors:
         raise Fail(errors, warnings=warnings)
     text, _ = load(path)
-    open_qs = unticked_questions(body_md_of(text, split_plan(text)[1]))
+    if out.get("block_format"):
+        open_qs = sum(1 for q in out.get("questions", []) if not q.get("ticked"))
+    else:
+        open_qs = unticked_questions(body_md_of(text, split_plan(text)[1]))
     if open_qs:  # a question the author lives with stays unticked: warn, never block
         warnings = warnings + [f"{open_qs} unticked open questions"]
     counts = gate_counts_of(out)
@@ -1956,15 +3068,21 @@ def import_file(path, data, home, dry_run=False):
     # a file that is not a plan, or a header that does not parse, is refused with the reason in
     # the reply and exit 0 — it is a "this file is not importable" answer, not a failed command.
     try:
-        lines, close = split_plan(text)
-        header = parse_header(lines[1:close])
+        if is_block_format(text):
+            header, out, _ = read_block_plan(text, sha)
+            _lines, close = split_plan(text)
+        else:
+            lines, close = split_plan(text)
+            header = parse_header(lines[1:close])
+            out = plan_json(header, sha)
     except Fail as e:
         raise Fail(e.errors, code=0, reason=e.errors[0])
-    out = plan_json(header, sha)
     plan_id = str(out["plan"])
     if not plan_id:
         raise Fail(["the header has no plan id (C4: only a +++ file with plan = \"<id>\" imports)"],
                    code=0, reason="no plan id in the header")
+    if _mkdb().is_bugs_run(plan_id):
+        raise Fail([RESERVED_PLAN_ERR])
     if inbox and inbox[1] != plan_id:
         raise Fail([f"inbox folder {inbox[1]!r} must equal the header plan id {plan_id!r}"],
                    code=0, reason="inbox folder name differs from the plan id")
@@ -2420,6 +3538,38 @@ def build_parser():
         d.add_argument("--data", default=None)
         d.add_argument("--home", default=None)
         d.set_defaults(func=func)
+
+    lg = sub.add_parser("log")
+    lg.add_argument("plan")
+    lg.add_argument("--kind", required=True)
+    lg.add_argument("--text", required=True)
+    lg.add_argument("--by", required=True)
+    lg.add_argument("--data", default=None)
+    lg.add_argument("--home", default=None)
+    lg.add_argument("--date", default=None)
+    lg.set_defaults(func=cmd_log)
+
+    ans = sub.add_parser("answer")
+    ans.add_argument("plan")
+    ans.add_argument("question")
+    ans.add_argument("--text", default="")
+    ans.add_argument("--by", required=True)
+    ans.add_argument("--data", default=None)
+    ans.add_argument("--home", default=None)
+    ans.add_argument("--date", default=None)
+    ans.set_defaults(func=cmd_answer)
+
+    ovr = sub.add_parser("override")
+    ovr.add_argument("plan")
+    ovr.add_argument("question")
+    ovr.add_argument("--task", required=True)
+    ovr.add_argument("--by", required=True)
+    ovr.add_argument("--text", default="")
+    ovr.add_argument("--data", default=None)
+    ovr.add_argument("--home", default=None)
+    ovr.add_argument("--date", default=None)
+    ovr.set_defaults(func=cmd_override)
+
     return p
 
 
@@ -3014,1330 +4164,12 @@ def hdr_source(one, plan):
 
 
 def self_test():
-    import shutil, sqlite3, subprocess
-    tmp = tempfile.mkdtemp(prefix="mk-plan-test-")
-    # every parse reads session.subagents, which resolves the data dir: pin it here so the run can
-    # never read the main checkout's .matrixkoder/ (and fail if it would)
-    restore_data = mk_config.pin_tmp_data(tmp)
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    real_plan = os.path.join(root, "scripts", "fixtures", "plan-link.md")  # a real plan, kept as a fixture
-    template = os.path.join(root, "skills", "matrixkoder", "templates", "plan.md")
-
-    def mk(*args, code=0):
-        r = subprocess.run([sys.executable, os.path.abspath(__file__), *args],
-                           capture_output=True, text=True)
-        lines = r.stdout.strip().splitlines()
-        assert len(lines) == 1, (args, r.stdout, r.stderr)
-        assert r.returncode == code, (args, r.returncode, r.stdout, r.stderr)
-        return json.loads(lines[0])
-
-    def write(name, text):
-        p = os.path.join(tmp, name)
-        with open(p, "w") as f:
-            f.write(text)
-        return p
-
-    def plan_text(phases="", status='status = "draft"', runs="runs = []", plan='plan = "t1"',
-                  top="", head_extra=""):
-        return (f"+++\n{plan}\n{status}\ncreated = 2026-10-08\n{runs}\n{top}\n"
-                f"[gates]\ntest = \"true\"\n{head_extra}\n{phases}+++\n\n# body\nmarkdown stays\n")
-
-    def phase(pid, wave=1, deps="", owned="", route="", size="standard", risk="reversible",
-              review="standard", subagents=False, lane_group="", extra="", tasks=""):
-        ow = f'owned = [{owned}]' if owned else "owned = []"
-        rt = f'route = "{route}"' if route else 'route = ""'
-        lg = f'lane_group = "{lane_group}"' if lane_group else 'lane_group = ""'
-        sa = "true" if subagents else "false"
-        dp = f"deps = [{deps}]" if deps else "deps = []"
-        return (f'[[phase]]\nid = "{pid}"\ntitle = "phase {pid}"\nwave = {wave}\n{dp}\n{ow}\n'
-                f'forbidden = []\n{rt}\nsize = "{size}"\nrisk = "{risk}"\nreview = "{review}"\n'
-                f"qa = []\ncommit = \"\"\nsubagents = {sa}\n{lg}\n{extra}{tasks}")
-
-    def task(tid, title="t", acceptance="a", refs="", subagent=False, owned="", extra=""):
-        sa = "true" if subagent else "false"
-        rf = f'refs = [{refs}]' if refs else "refs = []"
-        ow = f'owned = [{owned}]' if owned else "owned = []"
-        return (f"  [[phase.task]]\n  id = \"{tid}\"\n  title = \"{title}\"\n"
-                f"  acceptance = \"{acceptance}\"\n  {rf}\n  subagent = {sa}\n  {ow}\n{extra}")
-
-    def f2_warnings(warnings):
-        """F.2: the two advisory warnings a pre-F plan now carries (no plan-level final gate, an
-        item with neither gate nor manual). The assertions below compare against the warnings
-        that are NOT these, so an old plan still has to be otherwise quiet."""
-        # TPL.2 added advisories (missing description, Summary/Goal, no acceptance, a line no gate
-        # proves, a missing required key on an old plan) are filtered the same way: an old plan
-        # must still be otherwise quiet
-        return [w for w in warnings if "no final_gate in the plan" not in w
-                and not w.endswith(": neither gate nor manual line")
-                and not TPL_ADVICE_RE.search(w)]
-
-    try:
-        # P1.1 parse — the two real files (read-only) must give the C2 JSON
-        out = mk("parse", template)
-        with open(template, "rb") as f:
-            assert out["ok"] and out["sha"] == hashlib.sha256(f.read()).hexdigest()
-        assert out["plan"] == "feature-id" and out["status"] == "draft" and out["runs"] == []
-        assert set(out["gates"]) == {"test", "typecheck", "selftest", "validate", "c1"}
-        p0 = out["phases"][0]
-        assert p0["id"] == "P1" and p0["wave"] == 1 and p0["lane_group"] == "" and p0["subagents"] is True  # template default (user 2026-10-09)
-        assert p0["reviewer"] == "opencode opencode-go/kimi-k3"  # template's reviewer example passes through
-        assert p0["tasks"][0]["id"] == "P1.1" and p0["tasks"][0]["subagent"] is False
-        assert out["created"] == "2026-10-08" and out["design"] == []  # unknown/extra keys pass through
-
-        out = mk("parse", real_plan)
-        assert out["ok"] and out["plan"] == "plan-link" and out["status"] == "approved"
-        assert [p["id"] for p in out["phases"]] == ["P1", "P2", "P3"]
-        assert [t["id"] for t in out["phases"][0]["tasks"]] == ["P1.1", "P1.2", "P1.3"]
-        assert all(p["wave"] == 1 and p["lane_group"] == "A" and p["deps"] == [] for p in out["phases"])
-        assert all(p["reviewer"] == "" for p in out["phases"])  # optional key defaults to ""
-        assert out["phases"][0]["review"] == "data-loss" and out["phases"][0]["size"] == "standard"
-
-        # P1.2 check — both real files are clean (ok:true, exit 0): neither carries a real
-        # problem. F.2 adds the two advisories a plan written before F earns (no final gate, an
-        # item with neither gate nor manual), and the shipped template carries the F.2 fields, so
-        # only the fixture plan-link.md — which is NOT part of this change and stays as it is —
-        # is allowed to carry them.
-        out = mk("check", template)
-        assert out["ok"] and out["warnings"] == [] and out["sha"], out.get("warnings")
-        out = mk("check", real_plan)
-        assert out["ok"] and out["sha"] and f2_warnings(out["warnings"]) == [], out["plan"]
-        assert any("no final_gate in the plan" in w for w in out["warnings"])  # the F.2 advisory
-
-        # a phase without its own subagents key inherits session.subagents (yaml), else the
-        # schema default true; a phase that sets it keeps its own value
-        def parse_env(p, datadir):
-            r = subprocess.run([sys.executable, os.path.abspath(__file__), "parse", p],
-                               capture_output=True, text=True,
-                               env=dict(os.environ, MATRIXKODER_DATA=datadir))
-            lines = [x for x in r.stdout.strip().splitlines() if x]
-            assert r.returncode == 0 and len(lines) == 1, (p, r.stdout, r.stderr)
-            return json.loads(lines[0])
-
-        nokey = ('[[phase]]\nid = "P1"\ntitle = "t"\nwave = 1\ndeps = []\nowned = []\n'
-                 'forbidden = []\nroute = ""\nsize = "standard"\nrisk = "read_only"\n'
-                 'review = "light"\nqa = []\ncommit = ""\n\n')
-        dsub, dempty = os.path.join(tmp, "data-sub"), os.path.join(tmp, "data-empty")
-        os.makedirs(dsub), os.makedirs(dempty)
-        with open(mkpaths.legacy_yaml(dsub), "w") as f:
-            f.write("session:\n  subagents: false\n")
-        p = write("inherit-nokey.md", plan_text(phases=nokey))
-        assert parse_env(p, dsub)["phases"][0]["subagents"] is False  # inherited from the yaml
-        assert parse_env(p, dempty)["phases"][0]["subagents"] is True  # the schema default
-        p = write("inherit-own.md", plan_text(phases=phase("P1", subagents=True) + "\n"))
-        assert parse_env(p, dsub)["phases"][0]["subagents"] is True  # its own key wins
-
-        # a done/parked plan may have no phases
-        for st in ("done", "parked"):
-            p = write(f"done-{st}.md", plan_text(status=f'status = "{st}"'))
-            out = mk("parse", p)
-            assert out["ok"] and out["phases"] == []
-            assert mk("check", p)["ok"]
-
-        # unknown keys pass through (top, phase, task)
-        p = write("unknown.md", plan_text(
-            top='extra_top = "y"', phases=phase("P1", extra='foo = "bar"\n',
-                                                tasks=task("P1.1", extra="  zip = 1\n")) + "\n"))
-        out = mk("parse", p)
-        assert out["extra_top"] == "y" and out["phases"][0]["foo"] == "bar"
-        assert out["phases"][0]["tasks"][0]["zip"] == 1
-        assert mk("check", p)["ok"] is True
-
-        # errors: no leading +++, bad TOML (line number inside the file), missing file
-        p = write("noopen.md", 'plan = "x"\n+++\n+++\n')
-        out = mk("parse", p, code=2)
-        assert out["ok"] is False and out["errors"][0].startswith("line 1:"), out
-        mk("check", p, code=2)
-        p = write("noclose.md", '+++\nplan = "x"\n')
-        assert mk("parse", p, code=2)["errors"][0].startswith("line 3:")
-        p = write("badtoml.md", '+++\nplan = "t1"\nstatus = "draft"\ncreated == 2026-10-08\n+++\nbody\n')
-        out = mk("parse", p, code=2)
-        assert out["ok"] is False and out["errors"][0].startswith("line 4:"), out
-        mk("check", os.path.join(tmp, "nope.md"), code=3)
-
-        # CRLF plans parse like their LF twin; set/add-run keep the file's own endings
-        p = write("crlf.md", plan_text(phases=phase("P1") + "\n").replace("\n", "\r\n"))
-        with open(p, "rb") as f:
-            raw = f.read()
-        out = mk("parse", p)
-        assert out["ok"] and out["sha"] == hashlib.sha256(raw).hexdigest()
-        assert mk("check", p)["ok"] is True
-        assert mk("set", p, "--status", "approved")["status"] == "approved"
-        crlf = open(p, "rb").read()
-        assert crlf.replace(b"\r\n", b"\n") == raw.replace(b"\r\n", b"\n").replace(
-            b'status = "draft"', b'status = "approved"')
-        assert b"\n" not in crlf.replace(b"\r\n", b"")  # every newline still a \r\n
-        assert mk("parse", p)["status"] == "approved"
-        assert mk("add-run", p, "--run", "r1")["runs"] == ["r1"]
-        crlf = open(p, "rb").read()
-        assert 'runs = ["r1"]\r' in crlf.decode("utf-8") and b"\n" not in crlf.replace(b"\r\n", b"")
-
-        # the eight P1.2 error rules — each violates exactly one, parse stays ok
-        def bad(name, phases, needle):
-            p = write(f"{name}.md", plan_text(phases=phases + "\n"))
-            assert mk("parse", p)["ok"] is True, name
-            out = mk("check", p, code=2)
-            assert out["ok"] is False and any(needle in e for e in out["errors"]), (name, out)
-
-        bad("dup", phase("P1") + "\n" + phase("P1"), "duplicate phase id P1")
-        bad("dup-task", phase("P1", tasks=task("P1.1") + task("P1.1")), "duplicate task id P1.1")
-        bad("unknown-dep", phase("P1", deps='"PX"'), "unknown dep PX")
-        bad("cycle", phase("P1", deps='"P2"') + "\n" + phase("P2", wave=2, deps='"P1"'),
-            "dep cycle: P1 -> P2 -> P1")
-        bad("self-dep", phase("P1", deps='"P1"'), "dep cycle: P1 -> P1")
-        bad("later-wave", phase("P1", deps='"P2"') + "\n" + phase("P2", wave=2),
-            "dep P2 is in a later wave")
-        bad("size", phase("P1", size="huge"), "bad size 'huge'")
-        bad("risk", phase("P1", risk="wild"), "bad risk 'wild'")
-        bad("review", phase("P1", review="deep"), "bad review 'deep'")
-        bad("route-1", phase("P1", route="claude"), "bad route")
-        bad("route-4", phase("P1", route="a b c d"), "bad route")
-        bad("reviewer", phase("P1", extra='reviewer = 5\n'), "reviewer 5 is not a string")
-        bad("overlap", phase("P1", owned='"src/"') + "\n" + phase("P2", owned='"src/x.py"'),
-            "P1 and P2 both own")
-        bad("sub-share", phase("P1", subagents=True,
-                               tasks=task("P1.1", subagent=True, owned='"a.py"')
-                               + task("P1.2", subagent=True, owned='"a.py"')),
-            "subagent tasks P1.1 and P1.2 share a file")
-        bad("sub-no-owned", phase("P1", subagents=True, tasks=task("P1.1", subagent=True)),
-            "P1.1: subagent task with no owned")
-        bad("lane-waves", phase("P1", lane_group="A") + "\n" + phase("P2", wave=2, lane_group="A"),
-            "lane_group A: phases in different waves")
-
-        # reviewer: a string value passes through parse verbatim and checks clean
-        p = write("reviewer.md", plan_text(
-            phases=phase("P1", extra='reviewer = "opencode opencode-go/kimi-k3"\n') + "\n"))
-        out = mk("parse", p)
-        assert out["phases"][0]["reviewer"] == "opencode opencode-go/kimi-k3"
-        assert f2_warnings(mk("check", p)["warnings"]) == []
-
-        # warnings: advisories never fail the check
-        p = write("warn.md", plan_text(
-            plan='plan = "Bad_ID"', phases=phase("P1", deps='"r9:T1"',
-                                                 tasks=task("X.9")) + "\n"))
-        out = mk("check", p)
-        assert out["ok"] is True and out["warnings"], out
-        assert any("cross-run" in w and "r9:T1" in w for w in out["warnings"])
-        assert any("plan id" in w for w in out["warnings"])
-        assert any("<phase id>.<n>" in w for w in out["warnings"])
-        p = write("warn-keys.md", plan_text(
-            top="", phases='[[phase]]\nid = "P1"\ntitle = "t"\nwave = 1\ndeps = []\nowned = []\n'
-                           'route = ""\nsize = "standard"\nrisk = "read_only"\nreview = "light"\n'
-                           'qa = []\ncommit = ""\nsubagents = false\n\n'))
-        out = mk("check", p)
-        assert out["ok"] is True and f2_warnings(out["warnings"]) == [], out  # no optional keys: still quiet
-
-        # T1 — the header keys that fill a plans column: a missing one warns, never errors.
-        # each case is ok: true; on the pre-T1 code the warnings list is empty and these fail.
-        base = phase("P1", tasks=task("P1.1", acceptance="a")) + "\n"
-
-        p = write("no-created.md", '+++\nplan = "t1"\nstatus = "draft"\nruns = []\n'
-                                   '[gates]\ntest = "true"\n' + base + '+++\n\n# body\nmarkdown stays\n')
-        out = mk("check", p)
-        assert out["ok"] is True, out
-        assert any("created" in w and "plans.created" in w for w in out["warnings"]), out
-        assert not any("status" in w for w in out["warnings"]), out  # only the missing one
-
-        p = write("no-status.md", '+++\nplan = "t1"\ncreated = 2026-10-08\nruns = []\n'
-                                  '[gates]\ntest = "true"\n' + base + '+++\n\n# body\nmarkdown stays\n')
-        out = mk("check", p)
-        assert out["ok"] is True, out
-        assert any("status" in w and "plans.status" in w for w in out["warnings"]), out
-        assert not any("created" in w for w in out["warnings"]), out
-
-        p = write("no-h1.md", '+++\nplan = "t1"\nstatus = "draft"\ncreated = 2026-10-08\nruns = []\n'
-                               '[gates]\ntest = "true"\n' + base + '+++\n\n## Goal\nbody with no H1\n')
-        out = mk("check", p)
-        assert out["ok"] is True, out
-        assert any("H1" in w and "plans.title" in w for w in out["warnings"]), out
-        assert not any("status" in w or "created" in w for w in out["warnings"]), out
-
-        # a '#' inside a fenced block is not an H1; the fenced code is not a heading
-        p = write("fenced-h1.md", '+++\nplan = "t1"\nstatus = "draft"\ncreated = 2026-10-08\nruns = []\n'
-                                  '[gates]\ntest = "true"\n' + base + '+++\n\n```\n# not a heading\n```\n')
-        assert any("H1" in w for w in mk("check", p)["warnings"])
-
-        # both keys missing: both warnings, still ok: true (warnings never fail the check)
-        p = write("neither.md", '+++\nplan = "t1"\nruns = []\n[gates]\ntest = "true"\n' + base
-                               + '+++\n\nbody\n')
-        out = mk("check", p)
-        assert out["ok"] is True, out
-        assert any("created" in w for w in out["warnings"]) and any("status" in w for w in out["warnings"])
-        assert any("H1" in w for w in out["warnings"]), out
-
-        # ---------- TPL.2: per-section result, fit class, --classify, date strictness ----------
-        sections_md = "".join(f"## {n}\ntext\n\n" for n in BODY_SECTIONS)
-        fin = '[[final_gate]]\nid = "F1"\ncmd = "true"\ncovers = ["P1.1"]\n'
-        ph_head = ('[[phase]]\nid = "P1"\ntitle = "phase P1"\ndescription = "d"\nwave = 1\n'
-                   'owned = []\n{commit}subagents = false\n')
-        ph_task = ('  [[phase.task]]\n  id = "P1.1"\n  title = "t"\n  acceptance = ["a"]\n'
-                   '  gate = { cmd = "true", expect = 0, timeout = 60, lines = ["P1.1.a1"] }\n')
-
-        def tpl_plan(name, created="2026-10-08", head=ph_head.format(commit='commit = "c"\n'),
-                     task_md=ph_task, final=fin, body=None, status='status = "draft"'):
-            cr = f"created = {created}\n" if created else ""
-            return write(name, f'+++\nplan = "t1"\n{status}\n{cr}runs = []\ndescription = "d"\n{final}\n'
-                               f'{head}{task_md}+++\n\n# t1 — title\n\n'
-                               f'{sections_md if body is None else body}')
-
-        # template class: all seven sections and four parts found, no warning (TPL.2.a1)
-        out = mk("check", tpl_plan("tpl-full.md"))
-        assert out["ok"] and out["fit"] == "template" and out["missing"] == [], out
-        assert out["sections_found"] == 7 and out["sections_total"] == 7 and out["warnings"] == [], out
-        assert set(out["sections"]) == set(BODY_SECTIONS) and set(out["sections"].values()) == {"found"}
-        assert set(out["parts"]) == set(HEADER_PARTS) and set(out["parts"].values()) == {"found"}
-        # the shipped template and the repo's real plan fixture class by the same rule
-        assert mk("check", template)["fit"] == "template"
-        assert mk("check", real_plan)["fit"] in ("template", "partial")
-
-        # partial class: a valid header with no task lists tasks and acceptance (TPL.2.a2)
-        out = mk("check", tpl_plan("tpl-notask.md", task_md="", final=""))
-        assert out["ok"] and out["fit"] == "partial", out
-        assert out["missing"] == ["tasks", "acceptance", "final gate"], out
-        assert out["parts"]["header phases"] == "found" and out["parts"]["tasks"] == "missing"
-        assert out["sections_found"] == 7
-        # a missing body section is named and counted (TPL.2.a9)
-        out = mk("check", tpl_plan("tpl-norisks.md", body=sections_md.replace("## Risks\ntext\n\n", "")
-                                   + "### Risks\nonly a ### heading\n"))
-        assert out["fit"] == "partial" and out["missing"] == ["Risks"], out
-        assert out["sections_found"] == 6 and out["sections"]["Risks"] == "missing", out
-        # "header phases" means [[phase]] blocks, never the Phases body section
-        out = mk("check", write("tpl-nophase.md", '+++\nplan = "t1"\nstatus = "draft"\n'
-                                                 'created = 2026-10-08\nruns = []\n+++\n\n# t1\n\n'
-                                + sections_md))
-        assert out["fit"] == "not_a_plan" and out["sections"]["Phases"] == "found", out
-        assert out["parts"]["header phases"] == "missing" and out["sections_found"] == 7, out
-        # a section heading inside a comment or a fence is not a section
-        out = mk("check", tpl_plan("tpl-hidden.md", body=sections_md.replace("## Log\ntext\n\n", "")
-                                   + "<!-- ## Log -->\n```\n## Log\n```\n"))
-        assert out["missing"] == ["Log"], out
-
-        # not a plan: no +++ first line. --classify returns a class with exit 0; without it the
-        # old error and exit code stay (TPL.2.a3)
-        np = write("not-a-plan.md", "# just notes\n\n## Summary\nhello\n")
-        out = mk("check", np, "--classify")
-        assert out["ok"] is True and out["fit"] == "not_a_plan" and out["sections_found"] == 1, out
-        assert out["sections_total"] == 7 and "Goal" in out["missing"] and "tasks" in out["missing"], out
-        out = mk("check", np, code=2)
-        assert out["ok"] is False and out["errors"] == ["line 1: first line must be '+++'"], out
-        assert "fit" not in out
-        mk("check", os.path.join(tmp, "no-such-plan.md"), "--classify", code=3)  # a missing file stays an error
-
-        # date strictness: the same phase without commit is an error for a new plan and a warning
-        # for an older or undated one (TPL.2.a4, a5)
-        nocommit = ph_head.format(commit="")
-        out = mk("check", tpl_plan("tpl-new.md", created="2026-10-20", head=nocommit), code=2)
-        assert out["errors"] == ["P1: no commit key (required in a plan created on or after 2026-10-20)"], out
-        assert "fit" not in out  # an error reply carries the class only under --classify
-        out = mk("check", tpl_plan("tpl-new2.md", created="2026-10-20", head=nocommit), "--classify", code=2)
-        assert out["fit"] == "template" and out["missing"] == [], out  # the class rides on the error reply
-        for name, created in (("tpl-old.md", "2026-10-19"), ("tpl-undated.md", "")):
-            out = mk("check", tpl_plan(name, created=created, head=nocommit))
-            assert out["ok"] and any("P1: no commit key" in w for w in out["warnings"]), out
-        out = mk("check", tpl_plan("tpl-notitle.md", created="2026-10-21",
-                                   task_md=ph_task.replace('  title = "t"\n', "")), code=2)
-        assert any("P1.1: no title key" in e for e in out["errors"]), out
-        out = mk("check", tpl_plan("tpl-notitle-old.md", task_md=ph_task.replace('  title = "t"\n', "")))
-        assert out["ok"] and any("P1.1: no title key" in w for w in out["warnings"]), out
-        # a task with no acceptance / a line no gate proves is a warning for a new plan too
-        out = mk("check", tpl_plan("tpl-noacc.md", created="2026-10-21",
-                                   task_md=ph_task.replace('  acceptance = ["a"]\n', "")
-                                   .replace(', lines = ["P1.1.a1"]', "")))
-        assert out["ok"] and "P1.1: no acceptance" in out["warnings"], out
-        out = mk("check", tpl_plan("tpl-loose.md", created="2026-10-21",
-                                   task_md=ph_task.replace('acceptance = ["a"]', 'acceptance = ["a", "b"]')))
-        assert out["ok"] and "P1.1: acceptance line(s) P1.1.a2 proved by no gate" in out["warnings"], out
-        # a missing description is only ever a warning, at the top and phase level
-        out = mk("check", write("tpl-nodesc.md", open(os.path.join(tmp, "tpl-full.md")).read()
-                                .replace('description = "d"\n', "")), )
-        assert out["ok"] and "no description key in the header; advised: two to five plain sentences " \
-            "(plans.header_json only)" in out["warnings"], out
-        assert "P1: no description; advised: two to five plain sentences" in out["warnings"], out
-        # description at the top, phase and task level: accepted, passed through, no warning (TPL.1.a4).
-        # A regression guard: the old check never warned on an unknown key, so this passes on the old code too
-        dp = tpl_plan("tpl-desc.md", created="2026-10-21",
-                      task_md=ph_task + '  description = "what the task is"\n')
-        out = mk("check", dp)
-        assert out["ok"] and not [w for w in out["warnings"] if "description" in w], out
-        parsed = mk("parse", dp)
-        assert parsed["description"] == "d" and parsed["phases"][0]["description"] == "d"
-        assert parsed["phases"][0]["tasks"][0]["description"] == "what the task is"
-
-        # Summary drift warns, never errors (TPL.2.a7); matching lines are quiet
-        summ = ("## Summary\n- Phases: 1 — P1\n- Method: single lane · subagents off\n"
-                "- Lanes: P1 is its own lane\n- Delivery: main · pushed: no\n- Gates: F1 = true\n\n")
-        quiet = sections_md.replace("## Summary\ntext\n\n", summ)
-        out = mk("check", tpl_plan("tpl-sum-ok.md", created="2026-10-21", body=quiet))
-        assert out["ok"] and out["warnings"] == [], out
-        drift = quiet.replace("Phases: 1", "Phases: 3").replace("single lane · subagents off", "waves · subagents on") \
-            .replace("F1 = true", "G9 = other")
-        out = mk("check", tpl_plan("tpl-sum-drift.md", created="2026-10-21", body=drift))
-        assert out["ok"] is True, out
-        assert "Summary says 3 phases; the header has 1" in out["warnings"], out
-        assert any(w.startswith("Summary Method says waves · subagents on") for w in out["warnings"]), out
-        assert "Summary Gates does not list final gate F1 as id = cmd" in out["warnings"], out
-        out = mk("check", tpl_plan("tpl-sum-lane.md", created="2026-10-21", body=quiet.replace(
-            "P1 is its own lane", "each phase alone"), head=ph_head.format(commit='commit = "c"\n')
-            + 'lane_group = "A"\n'))
-        assert "Summary Lanes does not name lane_group A" in out["warnings"], out
-        # a missing Summary or Goal is a warning, not an error
-        out = mk("check", tpl_plan("tpl-nosum.md", created="2026-10-21", body=sections_md.replace(
-            "## Summary\ntext\n\n", "").replace("## Goal\ntext\n\n", "")))
-        assert out["ok"] and "body has no '## Summary' section (see templates/plan.md)" in out["warnings"], out
-        assert "body has no '## Goal' section (see templates/plan.md)" in out["warnings"], out
-
-        # approve warns "N unticked open questions" and still approves; check never errors on them (a8)
-        oq = sections_md.replace("## Open questions\ntext\n", "## Open questions\n- [ ] one — decides a\n"
-                                 "- [x] two — decided\n- [ ] three — decides b\n")
-        p = tpl_plan("tpl-oq.md", body=oq)
-        assert mk("check", p)["ok"] is True and not any("unticked" in w for w in mk("check", p)["warnings"])
-        tdata, thome = os.path.join(tmp, "tpl-data"), os.path.join(tmp, "tpl-home")
-        out = mk("approve", p, "--data", tdata, "--home", thome)
-        assert out["ok"] and out["status"] == "approved" and "2 unticked open questions" in out["warnings"], out
-        p = tpl_plan("tpl-oq0.md", body=oq.replace("- [ ] ", "- [x] "))
-        out = mk("approve", p, "--data", tdata, "--home", thome)
-        assert out["ok"] and not any("unticked" in w for w in out["warnings"]), out
-
-        # regression guard (TPL.2.a6, passes on the old code too): the old errors and exit code are
-        # unchanged by the new fields
-        out = mk("check", write("tpl-guard.md", plan_text(phases=phase("P1", route="opencode") + "\n")), code=2)
-        assert out["ok"] is False and any("bad route" in e for e in out["errors"]), out
-        assert "fit" not in out and "sections" not in out
-
-        # the shipped template is the contract: it names every key's home and checks with
-        # no new warning (the whole set above is empty for it)
-        out = mk("check", template)
-        assert out["ok"] and out["warnings"] == [], out
-        with open(template, encoding="utf-8") as fh:
-            tmpl = fh.read()
-        assert tmpl.startswith("+++\n") and "# Lifecycle" in tmpl
-        for needle in ("plans.id", "plans.status", "plans.created", "plans.design",
-                       "plans.integration", "plans.header_json", "plans.title",
-                       "tasks.id", "tasks.title", "tasks.acceptance", "tasks.owned",
-                       "tasks.deps", "tasks.parallel", "tasks.route_json", "tasks.type",
-                       "tasks.parent", "header_json only"):
-            assert needle in tmpl, needle
-        # F.2: the template documents the new contract and carries a working example — one task
-        # with a gate, one with a manual, critical/risk, an acceptance list and a final gate.
-        for needle in ("[[final_gate]]", "covers", "gate = { cmd", "manual = \"<why",
-                       "critical = true", "risk = 3"):
-            assert needle in tmpl, needle
-        p0 = out["phases"][0]
-        assert p0["tasks"][0]["gate"] and p0["tasks"][0]["acceptance_lines"] \
-            and len(p0["tasks"][0]["acceptance_lines"]) == 2, p0["tasks"][0]
-        assert any(t["manual"] for t in p0["tasks"]), p0["tasks"]
-        assert out["final_gates"] and out["final_gates"][0]["covers"], out["final_gates"]
-
-        # F0-BLOCK-BEGIN — F.0: a table gate is runnable, a plain string gate stays manual
-        p = write("gate-table.md", plan_text(head_extra=(
-            '\n[gates.slow]\ncmd = "sleep 5"\ntimeout = 1\n'
-            '\n[gates.strict]\ncmd = "true"\nexpect = 3\n')))
-        out = mk("parse", p)
-        assert out["gates"]["test"] == "true", out  # a plain string gate stays a string (manual)
-        assert out["gates"]["slow"] == {"cmd": "sleep 5", "expect": 0, "timeout": 1}, out
-        assert out["gates"]["strict"] == {"cmd": "true", "expect": 3, "timeout": 600}, out
-        assert mk("check", p)["ok"] is True, "a well-formed table gate must check clean"
-
-        # check rejects a table gate without cmd, and a non-int expect / timeout
-        for name, body, why in (("gate-nocmd.md", '[gates.x]\nexpect = 1\n', "needs cmd"),
-                                ("gate-badexpect.md", '[gates.x]\ncmd = "true"\nexpect = "zero"\n',
-                                 "expect must be an int"),
-                                ("gate-badtimeout.md", '[gates.x]\ncmd = "true"\ntimeout = "fast"\n',
-                                 "timeout must be an int")):
-            p = write(name, plan_text(head_extra="\n" + body))
-            e = mk("check", p, code=2)
-            assert e["ok"] is False, e
-            assert any("gate x" in x and why in x for x in e["errors"]), (name, e)
-        # F0-BLOCK-END
-
-        # F.2 — the plan contract: acceptance lines, per-task gate OR manual, critical/risk,
-        # header [[final_gate]] with covers, and the frozen-gate rules in approve.
-        f2_check_self_test(tmp, mk, write, plan_text, phase, task)
-
-        # P1.3 set — body byte-identical, only the status line changes
-        import shutil as sh
-        target = os.path.join(tmp, "set-target.md")
-        sh.copy(real_plan, target)
-        orig = open(target, "rb").read()
-        out = mk("set", target, "--status", "running")
-        assert out["ok"] and out["status"] == "running"
-        new = open(target, "rb").read()
-        ol, nl = orig.decode().split("\n"), new.decode().split("\n")
-        assert ol[2] == 'status = "approved"' and nl[2] == 'status = "running"'
-        assert "\n".join(ol[3:]) == "\n".join(nl[3:])  # body byte-identical
-        assert [l for i, l in enumerate(ol) if i != 2] == [l for i, l in enumerate(nl) if i != 2]
-        assert mk("parse", target)["status"] == "running"
-        assert os.listdir(tmp).count("set-target.md") == 1  # atomic: no temp files left
-        assert not [f for f in os.listdir(tmp) if f.startswith(".tmp-")]
-        mk("set", target, "--status", "bogus", code=2)
-        assert open(target, "rb").read() == new  # refused write changed nothing
-        p = write("set-comment.md", '+++\nplan = "t1"\nstatus = "draft"  # keep me\nruns = []\n+++\nbody\n')
-        mk("set", p, "--status", "approved")
-        got = open(p).read().split("\n")
-        assert got[2] == 'status = "approved"  # keep me', got[2]
-        assert got[3] == "runs = []" and got[4] == "+++" and "\n".join(got[5:]) == "body\n"
-        p = write("set-missing.md", '+++\nplan = "t1"\nruns = []\n+++\nbody\n')
-        before = open(p, "rb").read()
-        mk("set", p, "--status", "approved", code=2)
-        assert open(p, "rb").read() == before
-
-        # F3.1 — set --status approved runs check first: errors refuse the write
-        p = write("approve-bad.md", plan_text(phases=phase("P1", route="opencode") + "\n"))
-        assert mk("check", p, code=2)["errors"], "route 'opencode' (no model) fails check"
-        before = open(p, "rb").read()
-        out = mk("set", p, "--status", "approved", code=2)
-        assert out["ok"] is False and any("bad route" in e for e in out["errors"]), out
-        assert open(p, "rb").read() == before  # refused approval: file byte-identical
-        assert mk("set", p, "--status", "running")["status"] == "running"  # no check, unchanged
-        assert mk("parse", p)["status"] == "running"
-        # warnings alone never block an approval
-        p = write("approve-warn.md", plan_text(
-            plan='plan = "Bad_ID"', phases=phase("P1", deps='"r9:T1"') + "\n"))
-        out = mk("check", p)
-        assert out["ok"] is True and out["warnings"], out
-        assert mk("set", p, "--status", "approved")["status"] == "approved"
-        assert mk("parse", p)["status"] == "approved"
-
-        # write_atomic keeps the file's own mode; the temp + os.replace lands in a writable dir
-        p = write("mode.md", plan_text())
-        os.chmod(p, 0o444)
-        mk("set", p, "--status", "approved")
-        assert stat.S_IMODE(os.stat(p).st_mode) == 0o444, oct(os.stat(p).st_mode)
-        assert mk("parse", p)["status"] == "approved"
-        os.chmod(p, 0o644)  # cleanup deletes it either way
-
-        # P1.3 add-run — appends, idempotent, comments and body untouched
-        target = os.path.join(tmp, "run-target.md")
-        sh.copy(real_plan, target)
-        orig = open(target, "rb").read()
-        out = mk("add-run", target, "--run", "mk-1")
-        assert out["ok"] and out["added"] is True and out["runs"] == ["mk-1"]
-        new = open(target, "rb").read()
-        ol, nl = orig.decode().split("\n"), new.decode().split("\n")
-        assert nl[4] == 'runs = ["mk-1"]' and ol[4] == "runs = []"
-        assert [l for i, l in enumerate(ol) if i != 4] == [l for i, l in enumerate(nl) if i != 4]
-        assert mk("parse", target)["runs"] == ["mk-1"]
-        out = mk("add-run", target, "--run", "r2")
-        assert out["runs"] == ["mk-1", "r2"] and out["added"] is True
-        twice = open(target, "rb").read()
-        out = mk("add-run", target, "--run", "r2")  # idempotent: no rewrite at all
-        assert out["added"] is False and out["runs"] == ["mk-1", "r2"]
-        assert open(target, "rb").read() == twice
-        mk("add-run", target, "--run", "bad id", code=2)
-        assert open(target, "rb").read() == twice
-        p = write("run-comment.md", '+++\nplan = "t1"\nstatus = "draft"\nruns = []  # ids\n+++\nbody\n')
-        mk("add-run", p, "--run", "r1")
-        assert open(p).read().split("\n")[3] == 'runs = ["r1"]  # ids'
-        p = write("run-multi.md", '+++\nplan = "t1"\nstatus = "draft"\nruns = [\n  "r1",\n]  # end\n+++\nbody\n')
-        mk("add-run", p, "--run", "r2")
-        got = open(p).read().split("\n")
-        assert got[3] == 'runs = ["r1", "r2"]  # end', got[3]
-        assert got[4] == "+++" and "\n".join(got[5:]) == "body\n"  # span collapsed, body intact
-        assert mk("parse", p)["runs"] == ["r1", "r2"]
-
-        # D4 — nested subtasks parse; a plan with none is unchanged
-        p = write("nested.md", plan_text(phases=phase(
-            "P1", tasks=task("P1.1", extra=(
-                '  deps = "P1"\n  parallel = true\n  route = "opencode model high"\n'
-                '  [[phase.task.subtask]]\n  id = "P1.1.1"\n  title = "sub"\n'
-                '  acceptance = "done"\n  deps = ["P1.1"]\n  parallel = false\n'
-                '  route = { agent = "opencode", model = "m", effort = "low" }\n  owned = ["a.py"]\n'
-            ))) + "\n"))
-        out = mk("parse", p)
-        task0 = out["phases"][0]["tasks"][0]
-        sub = task0["subtasks"][0]
-        assert sub["id"] == "P1.1.1" and sub["deps"] == ["P1.1"] and sub["parallel"] is False
-        assert sub["route"] == {"agent": "opencode", "model": "m", "effort": "low"}
-        assert task0["deps"] == ["P1"] and task0["parallel"] is True
-        assert mk("check", p)["ok"] is True
-
-        # no store: approve validates and marks approved, and creates no mk.db
-        p = write("nostore.md", plan_text(phases=phase("P1", tasks=task("P1.1")) + "\n"))
-        empty_data = os.path.join(tmp, "empty-data")
-        empty_home = os.path.join(tmp, "empty-home")
-        out = mk("approve", p, "--data", empty_data, "--home", empty_home)
-        assert out["ok"] and out["store"] is False and out["status"] == "approved"
-        assert not os.path.exists(mkpaths.db_in(empty_data))
-        assert not os.path.exists(mkpaths.db_in(empty_home))
-        assert mk("parse", p)["status"] == "approved"
-        assert mk("approve", p, "--data", empty_data, "--home", empty_home).get("noop") is True
-        # a failing check refuses the write and still creates no store
-        badp = write("nostore-bad.md", plan_text(phases=phase("P1", route="opencode") + "\n"))
-        before = open(badp, "rb").read()
-        refused = mk("approve", badp, "--data", empty_data, "--home", empty_home, code=2)
-        assert any("bad route" in e for e in refused["errors"])
-        assert open(badp, "rb").read() == before
-        assert not os.path.exists(mkpaths.db_in(empty_data))
-
-        # with a store: import, archive, export; a failed approve leaves file and data
-        data = os.path.join(tmp, "store")
-        home = os.path.join(data, ".mk-home")
-        os.makedirs(data)
-        os.makedirs(home)
-        db = _mkdb()
-        db.open_project(home, data_dir=mkpaths.project_folder(data, home)).close()
-        good = write("sample.md", plan_text(
-            plan='plan = "sample"',
-            phases=phase("P1", tasks=task("P1.1", extra=(
-                '  [[phase.task.subtask]]\n  id = "P1.1.1"\n  title = "leaf"\n'
-                '  acceptance = "leaf done"\n  deps = "P1.1"\n  parallel = true\n  route = ""\n  owned = []\n'
-            ))) + "\n"))
-        good_before = open(good, "rb").read()
-        out = mk("approve", good, "--data", data, "--home", home, "--run", "r1")
-        assert out["ok"] and out["store"] is True and out["version"] == 1, out
-        # C13 + STORE.2: approve copies; the original file stays, byte for byte (the store row and
-        # the archive carry the approved status, the file's status line is not rewritten)
-        assert os.path.isfile(good), "approve must leave the original in place"
-        assert open(good, "rb").read() == good_before
-        assert b'status = "approved"' in open(out["archived"], "rb").read()
-        assert "run" not in out and out["tasks_run"] == "r1", out
-        arch = out["archived"]
-        assert os.path.isfile(arch)
-        archived_bytes = open(arch, "rb").read()
-        exp = mk("export", os.path.join(tmp, "sample.md"), "--data", data, "--home", home)
-        assert exp["ok"] and open(exp["path"], "rb").read() == archived_bytes
-        # header bytes of the round trip equal the archived header
-        def header_bytes(blob):
-            text = blob.decode("utf-8")
-            lines = text.split("\n")
-            close = next(i for i in range(1, len(lines)) if lines[i].strip() == "+++")
-            return "\n".join(lines[:close + 1]).encode()
-        assert header_bytes(open(exp["path"], "rb").read()) == header_bytes(archived_bytes)
-        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
-        rows = {r["id"]: (r["type"], r["parent"], r["deps"]) for r in con.execute(
-            "SELECT id, type, parent, deps FROM tasks WHERE run='r1'")}
-        con.close()
-        assert rows["P1"] == ("phase", None, "")
-        assert rows["P1.1"] == ("task", "P1", "")
-        assert rows["P1.1.1"] == ("subtask", "P1.1", "P1.1")
-        # same bytes again: no-op, archive kept
-        shutil.copy(arch, good)
-        out2 = mk("approve", good, "--data", data, "--home", home, "--run", "r1")
-        assert out2.get("noop") is True and out2["version"] == 1, out2
-        assert os.path.isfile(arch)
-        # a changed body is a new version; the old archive file stays
-        changed = open(good).read().replace("# body", "# body changed")
-        open(good, "w").write(changed)
-        out3 = mk("approve", good, "--data", data, "--home", home, "--run", "r1")
-        assert out3["version"] == 2 and os.path.isfile(arch) and os.path.isfile(out3["archived"])
-        assert out3["archived"] != arch and os.path.isfile(good)  # still a copy, not a move
-
-        # a named cycle leaves the file and the store unchanged
-        cyc = write("cyc.md", plan_text(plan='plan = "cyc"', phases=phase(
-            "P1", tasks=task("P1.1", extra=(
-                '  deps = "P1.1.1"\n  [[phase.task.subtask]]\n  id = "P1.1.1"\n  title = "s"\n'
-                '  acceptance = "a"\n  deps = "P1.1"\n  parallel = false\n  route = ""\n  owned = []\n'
-            ))) + "\n"))
-        blob = open(cyc, "rb").read()
-        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
-        n_before = con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"]
-        con.close()
-        bad = mk("approve", cyc, "--data", data, "--home", home, "--run", "r1", code=2)
-        # check and approve share the graph, so the refusal is check's "dep cycle:" (ids named)
-        assert any("cycle:" in e and "P1.1" in e and "P1.1.1" in e for e in bad["errors"]), bad
-        assert open(cyc, "rb").read() == blob
-        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
-        assert con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"] == n_before
-        assert con.execute("SELECT id FROM plans WHERE id='cyc'").fetchone() is None
-        con.close()
-
-        # <run>:<id> is validated: present passes, missing is named and changes nothing
-        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
-        db.add_task(con, "other", "T9", "task", title="ext")
-        con.close()
-        xref = write("xref.md", plan_text(plan='plan = "xref"', phases=phase("P1", deps='"other:T9"') + "\n"))
-        assert mk("approve", xref, "--data", data, "--home", home, "--run", "rx")["ok"]
-        missing = write("xref-bad.md", plan_text(
-            plan='plan = "xrefbad"', phases=phase("P1", deps='"other:NOPE"') + "\n"))
-        blob = open(missing, "rb").read()
-        bad = mk("approve", missing, "--data", data, "--home", home, "--run", "ry", code=2)
-        assert any("missing dep" in e and "other:NOPE" in e for e in bad["errors"]), bad
-        assert open(missing, "rb").read() == blob
-
-        # R3 — a forward dep (phase A on a later phase C, a task on a later sibling) approves
-        fwd = write("fwd.md", plan_text(plan='plan = "fwd"', phases=(
-            phase("PA", wave=1, deps='"PC"', tasks=task("PA.1", extra='  deps = "PA.2"\n')
-                  + task("PA.2"))
-            + "\n" + phase("PC", wave=1) + "\n")))
-        out = mk("approve", fwd, "--data", data, "--home", home, "--run", "rf")
-        assert out["ok"] and out["version"] == 1, out
-        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
-        deps = {r["id"]: r["deps"] for r in con.execute("SELECT id, deps FROM tasks WHERE run='rf'")}
-        con.close()
-        assert deps["PA"] == "PC" and deps["PA.1"] == "PA.2" and deps["PA.2"] == "", deps
-
-        # a cycle across two later items is refused and names both ids; file and store stay
-        cyc2 = write("cyc2.md", plan_text(plan='plan = "cyc2"', phases=(
-            phase("PA", wave=1, deps='"PC"') + "\n" + phase("PC", wave=1, deps='"PA"') + "\n")))
-        blob = open(cyc2, "rb").read()
-        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
-        n_before = con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"]
-        con.close()
-        bad = mk("approve", cyc2, "--data", data, "--home", home, "--run", "rc", code=2)
-        assert any("cycle:" in e and "PA" in e and "PC" in e for e in bad["errors"]), bad
-        assert open(cyc2, "rb").read() == blob
-        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
-        assert con.execute("SELECT COUNT(*) c FROM tasks").fetchone()["c"] == n_before
-        assert con.execute("SELECT id FROM plans WHERE id='cyc2'").fetchone() is None
-        con.close()
-
-        # a copy of the real mk-store plan approves; every phase and task lands with its deps
-        real = "/Users/rohits/Development/matrixkoder/.matrixkoder/plans/mk-store.md"
-        copy = os.path.join(tmp, "mk-store-copy.md")
-        shutil.copy(real, copy)
-        parsed = mk("parse", copy)
-        want = {}
-        for ph in parsed["phases"]:
-            want[ph["id"]] = ",".join(str(d) for d in ph["deps"])
-            for task_row in ph["tasks"]:
-                want[task_row["id"]] = ",".join(str(d) for d in task_row["deps"])
-        out = mk("approve", copy, "--data", data, "--home", home, "--run", "mkstore")
-        assert out["ok"] and os.path.isfile(copy), out  # copied, not moved
-        assert os.path.isfile(real)  # the real plan was never touched
-        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
-        got = {r["id"]: r["deps"] for r in con.execute(
-            "SELECT id, deps FROM tasks WHERE run='mkstore'")}
-        con.close()
-        assert set(got) == set(want), (sorted(set(want) - set(got)), sorted(set(got) - set(want)))
-        assert got == want
-
-        # CRLF export is byte-equal to the archived file
-        crlf = write("crlf-exp.md", plan_text(plan='plan = "crlfexp"', phases=phase("P1") + "\n").replace("\n", "\r\n"))
-        original = open(crlf, "rb").read()
-        out = mk("approve", crlf, "--data", data, "--home", home, "--run", "rcrlf")
-        assert out["ok"], out
-        archived = open(out["archived"], "rb").read()
-        dest = os.path.join(tmp, "crlfexp.md")
-        exp = mk("export", dest, "--data", data, "--home", home)
-        assert exp["ok"] and open(dest, "rb").read() == archived
-        assert b"\r\n" in archived and archived != original  # status line changed, endings did not
-        assert archived.replace(b"\r\n", b"") .count(b"\n") == 0
-
-        # a task or subtask with no id is a check error
-        noid = write("noid.md", plan_text(phases=phase("P1", tasks=(
-            '  [[phase.task]]\n  title = "missing"\n  acceptance = "a"\n'
-            '  [[phase.task.subtask]]\n  title = "also missing"\n  acceptance = "b"\n')) + "\n"))
-        bad = mk("check", noid, code=2)
-        assert any("task has no id" in e for e in bad["errors"]), bad
-        assert any("subtask has no id" in e for e in bad["errors"]), bad
-
-        # FB — a task-level cycle and a subtask self-dep are check errors, so set cannot approve them
-        tcyc = write("task-cycle.md", plan_text(phases=phase("P1", tasks=(
-            task("P1.1", extra='  deps = "P1.2"\n') + task("P1.2", extra='  deps = "P1.1"\n'))) + "\n"))
-        bad = mk("check", tcyc, code=2)
-        assert any(e.startswith("dep cycle:") and "P1.1" in e and "P1.2" in e for e in bad["errors"]), bad
-        before = open(tcyc, "rb").read()
-        refused = mk("set", tcyc, "--status", "approved", code=2)
-        assert any("dep cycle:" in e for e in refused["errors"])
-        assert open(tcyc, "rb").read() == before
-        refused = mk("approve", tcyc, "--data", empty_data, "--home", empty_home, code=2)
-        assert any("dep cycle:" in e for e in refused["errors"])
-        assert open(tcyc, "rb").read() == before
-        selfdep = write("self-sub.md", plan_text(phases=phase("P1", tasks=task("P1.1", extra=(
-            '  [[phase.task.subtask]]\n  id = "P1.1.1"\n  title = "s"\n  acceptance = "a"\n'
-            '  deps = "P1.1.1"\n  parallel = false\n  route = ""\n  owned = []\n'))) + "\n"))
-        bad = mk("check", selfdep, code=2)
-        assert any("dep cycle:" in e and "P1.1.1" in e for e in bad["errors"]), bad
-        before = open(selfdep, "rb").read()
-        mk("set", selfdep, "--status", "approved", code=2)
-        assert open(selfdep, "rb").read() == before
-
-        # FB — set --status approved names an unresolved cross-run dep instead of staying silent
-        xrefw = write("xref-warn.md", plan_text(phases=phase("P1", deps='"other-run:T1"') + "\n"))
-        warned = mk("set", xrefw, "--status", "approved")
-        assert warned["status"] == "approved", warned
-        assert any("cross-run" in w and "other-run:T1" in w for w in warned.get("warnings") or []), warned
-
-        # FB — a UTF-8 BOM survives check -> approve -> export byte for byte (status flip aside)
-        bom_text = plan_text(plan='plan = "bomplan"', phases=phase("P1", tasks=task("P1.1")) + "\n").replace("\n", "\r\n")
-        bom = write("bom.md", bom_text)
-        raw_bom = b"\xef\xbb\xbf" + open(bom, "rb").read()
-        open(bom, "wb").write(raw_bom)
-        assert mk("check", bom)["ok"] is True
-        out = mk("approve", bom, "--data", data, "--home", home, "--run", "rbom")
-        assert out["ok"] and os.path.isfile(bom), out  # the BOM file stays too
-        archived_bom = open(out["archived"], "rb").read()
-        assert open(bom, "rb").read() == raw_bom  # STORE.2: the file is not rewritten, the archive holds the approved bytes
-        assert archived_bom.startswith(b"\xef\xbb\xbf") and b"\r\n" in archived_bom
-        assert b'status = "approved"' in archived_bom
-        dest = os.path.join(tmp, "bomplan.md")
-        exp = mk("export", dest, "--data", data, "--home", home)
-        assert open(dest, "rb").read() == archived_bom
-
-        # FB — kill seam: 20 trials after the commit and 20 after the archive; the next approve converges
-        for step in ("commit", "archive"):
-            for n in range(20):
-                sdata = os.path.join(tmp, f"seam-{step}-{n}")
-                shome = os.path.join(sdata, ".mk-home")
-                os.makedirs(shome)
-                db.open_project(shome, data_dir=sdata).close()
-                src = write(f"seam-{step}-{n}.md", plan_text(
-                    plan=f'plan = "seam{step}{n}"', phases=phase("P1", tasks=task("P1.1")) + "\n"))
-                src_before = open(src, "rb").read()
-                env = dict(os.environ, MATRIXKODER_DATA=sdata, MK_PLAN_KILL_AFTER=step)
-                r = subprocess.run([sys.executable, os.path.abspath(__file__), "approve", src,
-                                    "--data", sdata, "--home", shome, "--run", "s1"],
-                                   capture_output=True, text=True, env=env)
-                assert r.returncode != 0, (step, n, r.returncode, r.stdout, r.stderr)
-                env.pop("MK_PLAN_KILL_AFTER", None)
-                r2 = subprocess.run([sys.executable, os.path.abspath(__file__), "approve", src,
-                                     "--data", sdata, "--home", shome, "--run", "s1"],
-                                    capture_output=True, text=True, env=env)
-                assert r2.returncode == 0, (step, n, r2.returncode, r2.stdout, r2.stderr)
-                got = json.loads(r2.stdout.strip().splitlines()[-1])
-                # commit-kill: the next approve finishes the missing archive (same version).
-                # archive-kill: the archive already matches, so the next approve is a no-op
-                # and the original stays, now on the approved bytes.
-                assert got["ok"] and got["version"] == 1, got
-                if step == "archive":
-                    assert got.get("noop") is True, got
-                # C13 + STORE.2: a kill leaves the original in place and the converging approve
-                # does not rewrite it; the archive holds the approved bytes
-                assert os.path.isfile(src), step
-                assert open(src, "rb").read() == src_before
-                assert os.path.isfile(got["archived"])
-                assert b'status = "approved"' in open(got["archived"], "rb").read()
-
-
-        # the run's plan path still resolves through mk-state after the file is archived
-        state = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mk-state.py")
-        link = os.path.join(tmp, "link.md")
-        open(link, "w").write(plan_text(plan='plan = "link"', phases=phase("P1") + "\n"))
-        r = subprocess.run([sys.executable, state, "--data", data, "run", "init", "--force",
-                            "--id", "lk", "--feature", "L", "--branch", "bl", "--plan", link],
-                           capture_output=True, text=True,  # an old-shape run: it starts from the plan FILE
-                           env=dict(os.environ, MK_LEGACY_RUN_INIT="1"))
-        assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
-        ap = mk("approve", link, "--data", data, "--home", home, "--run", "lk")
-        # the original path still resolves after the approve (the hermes-switchui issue): C13
-        # approve copies, so the file mk-state was pointed at is still there
-        assert ap["ok"] and os.path.isfile(link), ap
-        # the run is live (P1 is planned, not terminal): T1's rule refuses a bare sync,
-        # so this mechanics test passes --from-file ("the plan file wins")
-        r = subprocess.run([sys.executable, state, "--data", data, "plan", "sync", "--run", "lk",
-                            "--from-file"], capture_output=True, text=True)
-        assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
-        got = json.loads(r.stdout.strip().splitlines()[-1])
-        assert got["ok"] and got.get("plan") == "link", got
-
-        # D1.2 — approve copies (C13), data-dir fallback, tasks_run, import, delete, pause
-        def plans_rows(pid, datadir=data, homedir=home):
-            con = db.open_project(homedir, data_dir=datadir)
-            try:
-                n = con.execute("SELECT COUNT(*) c FROM plans WHERE id=?", (pid,)).fetchone()["c"]
-                row = con.execute("SELECT * FROM plans WHERE id=?", (pid,)).fetchone()
-            finally:
-                con.close()
-            return n, (dict(row) if row is not None else None)
-
-        # 1. a good file imports into exactly one plans row and touches no file byte.
-        # the stored version is 1 for a fresh id (STORE.1: an import is a version) and the reply reports it.
-        imp1 = write("imp1.md", plan_text(plan='plan = "imp1"', status='status = "draft"',
-                                          phases=phase("P1", tasks=task("P1.1")) + "\n").replace(
-            "# body", "# imp1 — Sample Title"))
-        blob1 = open(imp1, "rb").read()
-        out = mk("import", imp1, "--data", data, "--home", home)
-        assert out["ok"] is True and out["store"] is True and out["plan"] == "imp1", out
-        assert out["title"] == "Sample Title", out  # the H1 text after the em dash
-        n, row1 = plans_rows("imp1")
-        assert n == 1, n
-        assert row1["version"] == 1 and out["version"] == row1["version"], (row1, out)
-        assert row1["title"] == "Sample Title"
-        con = db.open_project(home, data_dir=mkpaths.project_folder(data, home))
-        n_tasks = con.execute(
-            "SELECT COUNT(*) c FROM tasks WHERE id IN ('P1','P1.1') AND run='imp1'").fetchone()["c"]
-        con.close()
-        assert n_tasks == 0, n_tasks  # import loads the plan, it does not approve the work
-        assert open(imp1, "rb").read() == blob1
-
-        # 2. the same bytes again: the upsert lands on the same row, byte for byte
-        out2 = mk("import", imp1, "--data", data, "--home", home)
-        assert out2["ok"] is True and out2["plan"] == "imp1", out2
-        n, row2 = plans_rows("imp1")
-        assert n == 1 and row2 == row1, (row1, row2)
-        assert out2["version"] == row1["version"]
-
-        # 3. no H1 in the body: the plan id is the title
-        imp3 = write("imp3.md", plan_text(plan='plan = "imp3"',
-                                          phases=phase("P1", tasks=task("P1.1")) + "\n").replace(
-            "# body", "## only a subheading\nbody text\n"))
-        out = mk("import", imp3, "--data", data, "--home", home)
-        assert out["ok"] is True and out["plan"] == "imp3" and out["title"] == "imp3", out
-        n, row3 = plans_rows("imp3")
-        assert n == 1 and row3["title"] == "imp3", (n, row3)
-
-        # 4. a file that is not a plan, and one whose header does not parse: both refused
-        # with ok:false and a reason, exit 0, and neither leaves a plans row behind
-        noopen = write("imp4a.md", 'plan = "imp4a"\n+++\n+++\nbody\n')
-        out = mk("import", noopen, "--data", data, "--home", home)
-        assert out["ok"] is False and isinstance(out.get("reason"), str) and out["reason"], out
-        badtoml = write("imp4b.md", '+++\nplan = "imp4b"\nstatus = "draft"\ncreated == 2026-10-08\n'
-                                    '+++\n\n# body\n')
-        out = mk("import", badtoml, "--data", data, "--home", home)
-        assert out["ok"] is False and isinstance(out.get("reason"), str) and out["reason"], out
-        assert plans_rows("imp4a")[0] == 0 and plans_rows("imp4b")[0] == 0
-
-        # 5. --dry-run reports exactly what a real import would, and writes nothing
-        imp5 = write("imp5.md", plan_text(plan='plan = "imp5"', status='status = "draft"',
-                                          phases=phase("P1", tasks=task("P1.1")) + "\n").replace(
-            "# body", "# imp5 — Dry Title"))
-        blob5 = open(imp5, "rb").read()
-        out = mk("import", imp5, "--dry-run", "--data", data, "--home", home)
-        assert out["ok"] is True and out["dry_run"] is True, out
-        assert out["plan"] == "imp5" and out["title"] == "Dry Title", out
-        assert plans_rows("imp5")[0] == 0
-        assert open(imp5, "rb").read() == blob5
-
-        # L10.6: inbox plans move into the project. The home is the one the import above used.
-        def inbox_plan(pid, header_id=None, docs=("notes.md", "mock/a.png")):
-            d = os.path.join(mkpaths.inbox_dir(home), pid)
-            for rel in docs:
-                os.makedirs(os.path.dirname(os.path.join(d, rel)), exist_ok=True)
-                with open(os.path.join(d, rel), "w") as f:
-                    f.write(f"doc {rel}\n")
-            os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, "plan.md"), "w") as f:
-                f.write(plan_text(plan=f'plan = "{header_id or pid}"',
-                                  phases=phase("P1", tasks=task("P1.1")) + "\n"))
-            return d
-        ib = inbox_plan("ibx1")
-        plan_md_bytes = open(os.path.join(ib, "plan.md"), "rb").read()
-        tgt_plan, tgt_assets = mkpaths.plan_file(data, "ibx1"), os.path.join(mkpaths.plan_dir(data, "ibx1"), "assets")
-        # dry-run: lists every move, changes nothing
-        out = mk("import", ib, "--dry-run", "--data", data, "--home", home)
-        assert out["ok"] and len(out["moved"]) == 3 and out["moved"][0]["to"] == tgt_plan, out
-        assert os.path.isdir(ib) and not os.path.exists(tgt_plan) and plans_rows("ibx1")[0] == 0
-        # a target plan.md with other bytes: refused, nothing moved, no row
-        os.makedirs(os.path.dirname(tgt_plan), exist_ok=True)
-        with open(tgt_plan, "w") as f:
-            f.write("someone else's plan\n")
-        out = mk("import", ib, "--data", data, "--home", home)
-        assert out["ok"] is False and out["reason"] == "target exists", out
-        assert os.path.isfile(os.path.join(ib, "notes.md")) and plans_rows("ibx1")[0] == 0
-        os.unlink(tgt_plan)
-        # a taken asset name refuses too
-        os.makedirs(tgt_assets, exist_ok=True)
-        with open(os.path.join(tgt_assets, "notes.md"), "w") as f:
-            f.write("other\n")
-        out = mk("import", os.path.join(ib, "plan.md"), "--data", data, "--home", home)
-        assert out["ok"] is False and out["reason"] == "target exists", out
-        assert not os.path.exists(tgt_plan)
-        os.unlink(os.path.join(tgt_assets, "notes.md"))
-        # the real move: row recorded, files at targets, source bytes kept, inbox folder gone
-        out = mk("import", ib, "--data", data, "--home", home)
-        assert out["ok"] and len(out["moved"]) == 3 and plans_rows("ibx1")[0] == 1, out
-        assert open(tgt_plan, "rb").read() == plan_md_bytes
-        assert open(os.path.join(tgt_assets, "notes.md")).read() == "doc notes.md\n"
-        assert open(os.path.join(tgt_assets, "mock", "a.png")).read() == "doc mock/a.png\n"
-        assert not os.path.exists(ib), "the emptied inbox folder was not removed"
-        # header id differs from the folder name: refused, nothing moved
-        bad = inbox_plan("ibx2", header_id="other-id")
-        out = mk("import", bad, "--data", data, "--home", home)
-        assert out["ok"] is False and "plan id" in out["reason"], out
-        assert os.path.isfile(os.path.join(bad, "notes.md")) and plans_rows("other-id")[0] == 0
-        # outside the inbox: unchanged behaviour, moved is empty, the file stays
-        out = mk("import", imp1, "--data", data, "--home", home)
-        assert out["ok"] and out["moved"] == [] and os.path.isfile(imp1), out
-
-        # 6. delete takes an ARCHIVED plan only; an unmigrated plan has no folder, so archive just
-        # flips the status. Backup first, then the rows go; an unarchived plan is refused.
-        plans_dir = os.path.join(data, "plans")
-        os.makedirs(plans_dir, exist_ok=True)
-        live = os.path.join(plans_dir, "imp6.md")
-        open(live, "w").write(plan_text(plan='plan = "imp6"', phases=phase("P1") + "\n"))
-        assert mk("import", live, "--data", data, "--home", home)["ok"]
-        out = mk("delete", "imp6", "--data", data, "--home", home, code=2)
-        assert "archive it first" in " ".join(out["errors"]) and plans_rows("imp6")[0] == 1, out
-        out = mk("archive", "imp6", "--data", data, "--home", home)
-        assert out["ok"] and len(out["moved"]) == 1 and not os.path.exists(live), out  # legacy plan file moved
-        out = mk("delete", "imp6", "--data", data, "--home", home)
-        assert out["ok"] and out["plan"] == "imp6" and out["purged"]["plans"] == 1, out
-        assert os.path.isfile(out["backup"]) and "imp6-pre-delete-" in out["backup"], out
-        assert os.path.isfile(mkpaths.archive_dir(data, "imp6", home) + "/plans/imp6.md")  # never unlinked
-        assert plans_rows("imp6")[0] == 0
-
-        # 7. live run refused (archive and delete); a held lane slot refuses delete; MK_ARCHIVE_FAIL
-        # leaves every row; a full purge leaves no row naming the plan and another plan's rows stay.
-        def project_con():
-            return db.open_project(home, data_dir=mkpaths.project_folder(data, home))
-
-        def named(con, plan_id, run_ids):
-            n = con.execute("SELECT COUNT(*) FROM plans WHERE id=?", (plan_id,)).fetchone()[0]
-            n += con.execute("SELECT COUNT(*) FROM runs WHERE plan=?", (plan_id,)).fetchone()[0]
-            for t in PURGE_BY_RUN:
-                n += con.execute(f"SELECT COUNT(*) FROM {t} WHERE run IN ({','.join('?' * len(run_ids))})",
-                                 run_ids).fetchone()[0]
-            return n
-
-        for pid in ("imp7", "imp8"):
-            f = os.path.join(plans_dir, pid + ".md")
-            open(f, "w").write(plan_text(plan=f'plan = "{pid}"', phases=phase("P1") + "\n"))
-            assert mk("import", f, "--data", data, "--home", home)["ok"]
-        con = project_con()
-        for pid, run in (("imp7", "imp7run"), ("imp8", "imp8run")):
-            con.execute("INSERT OR REPLACE INTO runs(id, plan, plan_version, branch, status, stage)"
-                        " VALUES (?,?,0,'br','active','build')", (run, pid))
-        con.commit()
-        con.close()
-        out = mk("archive", "imp7", "--data", data, "--home", home, code=2)
-        said = " ".join(out["errors"])
-        assert "imp7run" in said and "live run" in said and plans_rows("imp7")[0] == 1, out
-        con = project_con()
-        con.execute("UPDATE runs SET status='done'")
-        con.commit()
-        for run in ("imp7run", "imp8run", "imp7", "imp7-b"):  # imp7: import-time rows keyed by the plan id
-            db.add_task(con, run, "P1", "phase", title="kept")
-        for pid, run in (("imp7", "imp7run"), ("imp8", "imp8run")):
-            con.execute("INSERT INTO events(run, task, t, chan, kind, text) VALUES (?,'P1','t','c','k','x')", (run,))
-            con.execute("INSERT INTO artifacts(run, task, kind, text) VALUES (?,'P1','k','x')", (run,))
-            con.execute("INSERT INTO acks(run, msg, lane) VALUES (?,'m','l')", (run,))
-            con.execute("INSERT INTO waits(run, question) VALUES (?,'q')", (run,))
-            con.execute("INSERT INTO event_src(run, src) VALUES (?,'s')", (run,))
-        con.execute("INSERT INTO lane_slots(slot, run, state) VALUES ('s1','imp7run','busy')")
-        con.commit()
-        con.close()
-        assert mk("archive", "imp7", "--data", data, "--home", home)["ok"]
-        assert mk("archive", "imp8", "--data", data, "--home", home)["ok"]
-        out = mk("delete", "imp7", "--data", data, "--home", home, code=2)
-        assert "lane slot" in " ".join(out["errors"]) and plans_rows("imp7")[0] == 1, out
-        con = project_con()
-        con.execute("DELETE FROM lane_slots")
-        con.commit()
-        con.close()
-        os.environ["MK_DELETE_BACKUP_FAIL"] = "1"
-        try:
-            out = mk("delete", "imp7", "--data", data, "--home", home, code=2)
-        finally:
-            os.environ.pop("MK_DELETE_BACKUP_FAIL", None)
-        assert "backup failed" in " ".join(out["errors"]), out
-        con = project_con()
-        assert named(con, "imp7", ["imp7run"]) == 8, named(con, "imp7", ["imp7run"])
-        con.close()
-        arch = mkpaths.archive_dir(data, None, home)
-        assert not [n for n in os.listdir(arch) if n.endswith(".tmp")], os.listdir(arch)
-        # a child row written between the backup and the purge aborts delete; nothing is deleted
-        os.environ["MK_DELETE_RACE_SQL"] = ("INSERT INTO events(run, task, t, chan, kind, text)"
-                                            " VALUES ('imp7run','P1','t','c','k','late')")
-        try:
-            out = mk("delete", "imp7", "--data", data, "--home", home, code=2)
-        finally:
-            os.environ.pop("MK_DELETE_RACE_SQL", None)
-        said = " ".join(out["errors"])
-        assert "events went from 1 to 2" in said and "backup kept at" in said, out
-        con = project_con()
-        assert named(con, "imp7", ["imp7run"]) == 9, "the aborted delete changed rows"
-        con.execute("DELETE FROM events WHERE text='late'")
-        con.commit()
-        con.close()
-        # a failure mid-purge rolls the whole transaction back
-        os.environ["MK_PURGE_FAIL"] = "1"
-        try:
-            r = subprocess.run([sys.executable, os.path.abspath(__file__), "delete", "imp7",
-                                "--data", data, "--home", home], capture_output=True, text=True)
-        finally:
-            os.environ.pop("MK_PURGE_FAIL", None)
-        assert r.returncode != 0 and "injected purge failure" in r.stderr, (r.stdout, r.stderr)
-        con = project_con()
-        assert named(con, "imp7", ["imp7run"]) == 8, "a mid-purge failure left a partial delete"
-        con.close()
-        out = mk("delete", "imp7", "--data", data, "--home", home)
-        assert out["purged"]["event_src"] == 1, out
-        assert out["ok"] and out["purged"]["tasks"] == 2 and out["purged"]["runs"] == 1, out
-        con = project_con()
-        assert named(con, "imp7", ["imp7run"]) == 0
-        assert named(con, "imp8", ["imp8run"]) == 8, "another plan's rows were touched"
-        left = con.execute("SELECT run FROM tasks WHERE run IN ('imp7','imp7-b','imp7run','imp8run') ORDER BY run").fetchall()
-        assert [r[0] for r in left] == ["imp7-b", "imp8run"], [r[0] for r in left]  # plan-id rows gone, prefix plan kept
-        con.close()
-        chk = sqlite3.connect("file:" + urllib.parse.quote(out["backup"]) + "?mode=ro", uri=True)
-        assert chk.execute("SELECT COUNT(*) FROM runs WHERE plan='imp7'").fetchone()[0] == 1
-        chk.close()
-
-        # 8. asset set: archive moves the C2 folder, plans/<id>.md, plans/archive/<id>-v<n>.md and the
-        # run folders (layout kept) and nothing of an id-prefix plan; unarchive restores them
-        # byte-identical; a completed archive is refused; a taken archive name gets a stamp.
-        def put(path, text):
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            open(path, "w").write(text)
-
-        def snap(paths):
-            out = {}
-            for q in paths:
-                for dp, _, fs in os.walk(q) if os.path.isdir(q) else [(os.path.dirname(q), 0, [os.path.basename(q)])]:
-                    for f in fs:
-                        out[os.path.join(dp, f)] = open(os.path.join(dp, f), "rb").read()
-            return out
-
-        def seed(pid, status=None):
-            f = os.path.join(plans_dir, pid + ".md")
-            put(f, plan_text(plan=f'plan = "{pid}"', phases=phase("P1") + "\n"))
-            assert mk("import", f, "--data", data, "--home", home)["ok"]
-            con = project_con()
-            con.execute("UPDATE plans SET status=? WHERE id=?", (status, pid))
-            con.execute("INSERT INTO runs(id, plan, plan_version, branch, status, stage) VALUES (?,?,0,'b','done','x')",
-                        (pid + "run", pid))
-            con.commit()
-            con.close()
-
-        seed("imp9", "parked")
-        seed("imp9-extra", "done")  # shares the id prefix: must stay untouched
-        pdir = mkpaths.plan_dir(data, "imp9")
-        put(os.path.join(pdir, "assets", "a.txt"), "asset\n")
-        put(os.path.join(pdir, "plan.md"), "x\n")
-        v1, v2 = (os.path.join(plans_dir, "archive", f"imp9-v{n}.md") for n in (1, 2))
-        put(v1, "v1\n"), put(v2, "v2\n")
-        put(os.path.join(plans_dir, "archive", "imp9-extra-v1.md"), "decoy\n")
-        put(os.path.join(data, mkpaths.RUNS_LEGACY_NAME, "imp9run", "r.txt"), "legacy run\n")
-        put(os.path.join(data, "runs", "imp9run", "y.txt"), "run\n")
-        con = project_con()
-        con.execute("UPDATE plans SET archived_path=? WHERE id='imp9'", (v2,))
-        con.commit()
-        con.close()
-        decoys = [os.path.join(plans_dir, "imp9-extra.md"), os.path.join(plans_dir, "archive", "imp9-extra-v1.md")]
-        assets = [pdir, os.path.join(plans_dir, "imp9.md"), v1, v2,
-                  os.path.join(data, mkpaths.RUNS_LEGACY_NAME, "imp9run"), os.path.join(data, "runs", "imp9run")]
-        before_assets, before_decoys = snap(assets), snap(decoys)
-        out = mk("archive", "imp9", "--data", data, "--home", home)
-        base = mkpaths.archive_dir(data, "imp9", home)
-        assert len(out["moved"]) == 6 and all(m.startswith(base + os.sep) for m in out["moved"]), out
-        assert not any(os.path.exists(q) for q in assets), "an asset stayed behind"
-        assert snap(decoys) == before_decoys, "an id-prefix plan's files were touched"
-        assert os.path.isfile(os.path.join(base, "folder", "assets", "a.txt"))
-        assert os.path.isfile(os.path.join(base, "plans", "archive", "imp9-v2.md"))
-        assert os.path.isfile(os.path.join(base, mkpaths.RUNS_LEGACY_NAME, "imp9run", "r.txt"))
-        con = project_con()
-        r9 = con.execute("SELECT status, header_json, archived_path FROM plans WHERE id='imp9'").fetchone()
-        con.close()
-        h9 = json.loads(r9["header_json"])
-        assert r9["status"] == "archived" and h9["archived_from"] == "parked" and h9["archived_to"] == base
-        assert len(h9["archived_files"]) == 6 and r9["archived_path"] == os.path.join(base, "plans", "archive", "imp9-v2.md")
-        out = mk("archive", "imp9", "--data", data, "--home", home, code=2)  # completed: refused
-        assert "already archived at" in " ".join(out["errors"]), out
-        put(os.path.join(plans_dir, "imp9.md"), "squatter\n")
-        out = mk("unarchive", "imp9", "--data", data, "--home", home, code=2)  # original occupied
-        assert "already exists" in " ".join(out["errors"]) and "imp9.md" in " ".join(out["errors"]), out
-        os.remove(os.path.join(plans_dir, "imp9.md"))
-        os.rename(os.path.join(base, "plans", "archive", "imp9-v1.md"), os.path.join(base, "away"))
-        out = mk("unarchive", "imp9", "--data", data, "--home", home, code=2)  # archived item gone
-        assert "missing" in " ".join(out["errors"]) and "imp9-v1.md" in " ".join(out["errors"]), out
-        os.rename(os.path.join(base, "away"), os.path.join(base, "plans", "archive", "imp9-v1.md"))
-        out = mk("unarchive", "imp9", "--data", data, "--home", home)
-        assert len(out["moved"]) == 6 and not os.path.exists(base), out
-        assert snap(assets) == before_assets, "unarchive did not restore the files byte-identical"
-        assert snap(decoys) == before_decoys
-        con = project_con()
-        r9 = con.execute("SELECT status, header_json, archived_path FROM plans WHERE id='imp9'").fetchone()
-        con.close()
-        h9 = json.loads(r9["header_json"])
-        assert r9["status"] == "parked" and not {"archived_from", "archived_to", "archived_files"} & set(h9)
-        assert r9["archived_path"] == v2
-        out = mk("unarchive", "imp9", "--data", data, "--home", home, code=2)  # not archived now
-        assert "not archived" in " ".join(out["errors"]), out
-
-        # crash recovery: status written, archived_to recorded, folder never moved -> unarchive
-        # just restores the status
-        seed("impc", "done")
-        con = project_con()
-        con.execute("UPDATE plans SET status='archived', header_json=? WHERE id='impc'",
-                    (json.dumps({"archived_from": "done", "archived_to": os.path.join(data, "nowhere")}),))
-        con.commit()
-        con.close()
-        out = mk("unarchive", "imp" + "c", "--data", data, "--home", home)
-        assert out["ok"] and os.path.isfile(os.path.join(plans_dir, "impc.md")), out
-        con = project_con()
-        assert con.execute("SELECT status FROM plans WHERE id='impc'").fetchone()[0] == "done"
-        con.close()
-
-        # repair: already 'archived' with no record and the legacy files still in place -> the move
-        # happens; a second archive then refuses; a taken archive name gets a stamp, never overwritten
-        seed("impb", "archived")
-        taken = mkpaths.archive_dir(data, "impb", home)
-        put(os.path.join(taken, "old.md"), "older\n")
-        out = mk("archive", "impb", "--data", data, "--home", home)
-        assert len(out["moved"]) == 1 and out["moved"][0].startswith(taken + "-"), out  # plan file only
-        assert open(os.path.join(taken, "old.md")).read() == "older\n"
-        assert not os.path.exists(os.path.join(plans_dir, "impb.md"))
-        con = project_con()
-        hb = json.loads(con.execute("SELECT header_json FROM plans WHERE id='impb'").fetchone()[0])
-        con.close()
-        assert out["moved"][0].startswith(hb["archived_to"] + os.sep) and hb["archived_to"].startswith(taken + "-")
-        out = mk("archive", "impb", "--data", data, "--home", home, code=2)
-        assert "already archived at" in " ".join(out["errors"]), out
-
-        # D1.1 columns: filled when present, harmless when absent
-        cols_data = os.path.join(tmp, "store-cols")
-        cols_home = os.path.join(cols_data, ".mk-home")
-        os.makedirs(cols_home)
-        db.open_project(cols_home, data_dir=cols_data).close()
-        con = db.open_project(cols_home, data_dir=cols_data)
-        have = {r[1] for r in con.execute("PRAGMA table_info(plans)")}
-        for col, decl in (("status", "TEXT"), ("created", "TEXT"),
-                          ("design", "TEXT"), ("integration", "TEXT")):
-            if col not in have:  # a v4 store (D1.1) already has them
-                con.execute(f"ALTER TABLE plans ADD COLUMN {col} {decl}")
-        con.commit()
-        con.close()
-        colp = write("cols.md", plan_text(
-            plan='plan = "cols"', top='design = ["a.py"]\nintegration = ["b.py"]',
-            phases=phase("P1", tasks=task("P1.1")) + "\n").replace("# body", "# cols — Col Title"))
-        out = mk("import", colp, "--data", cols_data, "--home", cols_home)
-        assert out["ok"] and out["title"] == "Col Title", out
-        n, crow = plans_rows("cols", cols_data, cols_home)
-        assert n == 1 and crow["status"] == "draft" and crow["created"] == "2026-10-08", crow
-        assert json.loads(crow["design"]) == ["a.py"] and json.loads(crow["integration"]) == ["b.py"]
-        out = mk("approve", colp, "--data", cols_data, "--home", cols_home, "--run", "colsrun")
-        assert out["ok"] and os.path.isfile(colp), out
-        n, crow = plans_rows("cols", cols_data, cols_home)
-        assert crow["status"] == "approved" and crow["version"] == 1, crow
-        # the shared store has none of the four columns: approve and import still succeed
-        plain = write("plain.md", plan_text(plan='plan = "plain"', phases=phase("P1") + "\n"))
-        assert mk("import", plain, "--data", data, "--home", home)["ok"]
-        assert mk("approve", plain, "--data", data, "--home", home, "--run", "plainrun")["ok"]
-
-        # pause and back (STORE.2): plans.status changes in the store and the file's bytes stay; parse
-        # and check answer with the store's status once the plan is stored
-        col_before = open(colp, "rb").read()
-        parked = mk("set", colp, "--status", "parked", "--data", cols_data, "--home", cols_home)
-        assert parked["status"] == "parked" and parked.get("store") is True, parked
-        assert open(colp, "rb").read() == col_before
-        assert mk("parse", colp, "--data", cols_data, "--home", cols_home)["status"] == "parked"
-        assert mk("parse", colp)["status"] == "draft"  # no store resolved: the file answers as before
-        n, crow = plans_rows("cols", cols_data, cols_home)
-        assert crow["status"] == "parked", crow
-        back = mk("set", colp, "--status", "approved", "--data", cols_data, "--home", cols_home)
-        assert back["status"] == "approved", back
-        n, crow = plans_rows("cols", cols_data, cols_home)
-        assert crow["status"] == "approved", crow
-        # the plan is in the store: set changes the store row and never the file
-        plain_before = open(plain, "rb").read()
-        assert mk("set", plain, "--status", "parked", "--data", data, "--home", home)["status"] == "parked"
-        assert mk("parse", plain, "--data", data, "--home", home)["status"] == "parked"
-        assert mk("set", plain, "--status", "approved", "--data", data, "--home", home)["status"] == "approved"
-        assert open(plain, "rb").read() == plain_before
-
-        # no --data, cwd = a temp repo whose .matrixkoder/mk.db exists -> store: true
-        repo = os.path.join(tmp, "repo")
-        os.makedirs(os.path.join(repo, ".matrixkoder"))
-        subprocess.run(["git", "init", "-q", repo], check=True)
-        db.open_project(os.path.join(repo, ".mk-home"),
-                        data_dir=os.path.join(repo, ".matrixkoder")).close()
-        rp = os.path.join(repo, "repoplan.md")
-        open(rp, "w").write(plan_text(plan='plan = "repoplan"', phases=phase("P1") + "\n"))
-        r = subprocess.run([sys.executable, os.path.abspath(__file__), "approve", rp,
-                            "--home", os.path.join(repo, ".mk-home")],
-                           capture_output=True, text=True, cwd=repo,
-                           env={k: v for k, v in os.environ.items() if k != "MATRIXKODER_DATA"})
-        assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
-        got = json.loads(r.stdout.strip().splitlines()[-1])
-        assert got["ok"] and got["store"] is True, got
-        assert os.path.isfile(rp) and os.path.isfile(got["archived"])
-        assert "tasks_run" in got and "run" not in got, got
-
-        # file-only next to an existing mk.db names that store in a warning
-        side = os.path.join(tmp, "side")
-        os.makedirs(side)
-        open(mkpaths.db_in(side), "wb").close()
-        sp = os.path.join(side, "side.md")
-        open(sp, "w").write(plan_text(plan='plan = "sideplan"', phases=phase("P1") + "\n"))
-        r = subprocess.run([sys.executable, os.path.abspath(__file__), "approve", sp],
-                           capture_output=True, text=True, cwd=tmp,
-                           env={k: v for k, v in os.environ.items() if k != "MATRIXKODER_DATA"})
-        assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
-        got = json.loads(r.stdout.strip().splitlines()[-1])
-        assert got["store"] is False and any(os.path.basename(mkpaths.db_in(side)) in w for w in got.get("warnings") or []), got
-
-        # C2 (L3.2): on a MIGRATED project (root db_path set by L2's mk-migrate --switch) import,
-        # approve and delete write plans and archives under projects/<slug>/plans/<id>/ and leave
-        # the repo's .matrixkoder byte-identical.
-        def tree_hash(top):
-            h = hashlib.sha256()
-            for dirpath, dirnames, filenames in os.walk(top):
-                dirnames.sort()
-                for name in sorted(filenames):
-                    full = os.path.join(dirpath, name)
-                    h.update(os.path.relpath(full, top).encode())
-                    with open(full, "rb") as fh:
-                        h.update(fh.read())
-            return h.hexdigest()
-
-        mig_repo = os.path.join(tmp, "mig-repo")
-        mig_data = os.path.join(mig_repo, ".matrixkoder")
-        os.makedirs(os.path.join(mig_data, "plans", "archive"), exist_ok=True)
-        subprocess.run(["git", "init", "-q", mig_repo], check=True)
-        pre = os.path.join(mig_data, "plans", "old.md")
-        open(pre, "w").write(plan_text(plan='plan = "old"', phases=phase("P1") + "\n"))
-        open(mkpaths.legacy_yaml(mig_data), "w").write("data_dir: .matrixkoder/\n")
-        home = os.environ["MK_HOME"]
-        db.open_project(home, "migs", data_dir=mig_data).close()
-        con = db.open_root(home)
-        con.execute("INSERT OR REPLACE INTO projects(slug, name, repo, data_dir, mode, db_path)"
-                    " VALUES (?,?,?,?,?,NULL)", ("migs", "migs", mig_repo, os.path.realpath(mig_data), "home"))
-        con.commit()
-        con.close()
-        r = subprocess.run([sys.executable, os.path.join(root, "scripts", "mk-migrate.py"),
-                            "--switch", "--slug", "migs", "--data", mig_data, "--home", home,
-                            "--repo", mig_repo],
-                           capture_output=True, text=True, env=dict(os.environ, MK_SELFTEST="1"))
-        assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
-        proj = os.path.join(home, "projects", "migs")
-        before = tree_hash(mig_data)
-
-        mp = write("migplan.md", plan_text(plan='plan = "migplan"',
-                                           phases=phase("P1", tasks=task("P1.1")) + "\n"))
-        out = mk("import", mp, "--data", mig_data, "--home", home)
-        assert out["ok"], out
-        # Z15 (R02): import on a migrated project ensures the plan folder's assets/ too
-        assert os.path.isdir(os.path.join(proj, "plans", "migplan", "assets")), \
-            "a migrated import did not create the plan folder's assets/"
-        # the dashboard List reads the root plan_summary: an imported draft must be in it
-        con = db.open_root(home)
-        n_sum = con.execute("SELECT COUNT(*) c FROM plan_summary WHERE project='migs' AND plan='migplan'").fetchone()["c"]
-        con.close()
-        assert n_sum == 1 and "warnings" not in out, (n_sum, out)
-        out = mk("approve", mp, "--data", mig_data, "--home", home, "--run", "migrun")
-        assert out["ok"] and out["version"] == 1, out
-        assert out["archived"] == os.path.join(proj, "plans", "migplan", "archive", "migplan-v1.md"), out
-        assert os.path.isfile(os.path.join(proj, "plans", "migplan", "archive", "migplan-v1.md"))
-        # Z15 (R02): approve keeps the plan.md copy AND ensures assets/ exists (C2). This FAILS on
-        # e83e6e9 (proof in the report): assets/ was never created.
-        assert os.path.isfile(os.path.join(proj, "plans", "migplan", "plan.md")), \
-            "the approved plan.md is missing from the migrated plan folder"
-        assert os.path.isdir(os.path.join(proj, "plans", "migplan", "assets")), \
-            "a migrated approve did not create the plan folder's assets/ (R02)"
-        # a second approve on the same bytes stays a no-op and keeps the folder intact
-        out = mk("approve", mp, "--data", mig_data, "--home", home, "--run", "migrun")
-        assert out["ok"] and out.get("noop") is True, out
-        assert os.path.isdir(os.path.join(proj, "plans", "migplan", "assets")), \
-            "the no-op approve dropped the plan folder's assets/"
-        out = mk("archive", "migplan", "--data", mig_data, "--home", home)
-        arch = os.path.join(proj, "archive", "plans", "migplan")
-        assert out["ok"] and out["moved"] == [os.path.join(arch, "folder")], out
-        assert os.path.isfile(os.path.join(arch, "folder", "plan.md")) and os.path.isdir(os.path.join(arch, "folder", "assets"))
-        assert not os.path.exists(os.path.join(proj, "plans", "migplan"))
-        out = mk("delete", "migplan", "--data", mig_data, "--home", home)
-        assert out["ok"] and os.path.dirname(out["backup"]) == os.path.join(proj, "archive"), out
-        assert os.path.isfile(os.path.join(arch, "folder", "plan.md")), "delete unlinked the archived folder"
-        # nothing was written under the repo's .matrixkoder
-        assert tree_hash(mig_data) == before, "a migrated mk-plan wrote under the repo .matrixkoder"
-
-        # F.2 approve — counts, the frozen gate fields (a change is a new version naming the field)
-        # and the --user-ack refusal. db and mkpaths are already in scope here.
-        f2_approve_self_test(tmp, mk, write, plan_text, phase, task, db, mkpaths)
-
-        # C1: the plan-level `description` rides header_json when it is a non-empty string, else
-        # the key is absent (a plan without one is unchanged)
-        base = {"runs": [], "gates": {}, "final_gates": [], "phases": []}
-        assert json.loads(header_json_of(dict(base, description="Why this plan"), "s", "b", "draft")
-                          )["description"] == "Why this plan"
-        for none in ({}, {"description": ""}, {"description": "  "}, {"description": 5}):
-            assert "description" not in json.loads(header_json_of(dict(base, **none), "s", "b", "draft"))
-
-        # STORE: versioned plan_items, status/runs in the store, item set
-        store_self_test(tmp, mk, write, plan_text, phase, task, db, mkpaths)
-
-        print("mk-plan self-test ok")
-    finally:
-        restore_data()
-        shutil.rmtree(tmp, ignore_errors=True)
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    test_py = os.path.join(here, 'test-mk-plan.py')
+    res = subprocess.run([sys.executable, test_py])
+    if res.returncode != 0:
+        sys.exit(res.returncode)
 
 
 if __name__ == "__main__":

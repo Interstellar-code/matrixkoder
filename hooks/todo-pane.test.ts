@@ -30,6 +30,7 @@ async function world(
     process: async argv => {
       calls.push([...argv])
       if (argv.includes('overview')) return reply(overviewOf(st.slug))
+      if (String(argv[1] ?? '').endsWith('/scripts/mk-bug.py')) return reply({ ok: true, bug: { id: 'B7', title: arg(argv, '--title') } })
       const at = argv.indexOf('todo')
       if (at < 0) return undefined
       const verb = argv[at + 1]
@@ -65,14 +66,14 @@ async function world(
 
 const SAVED = { text: /saved in the overview db/ }
 
-test('P3.1: the tab bar gains Todo (hotkey t) before Improve and Settings; pressing it draws the Todo header', { plugins: [worldFixtures] }, async ($, on) => {
+test('P3.1: the tab bar gains Todo (hotkey t) after Bugs, before Improve and Settings; pressing it draws the Todo header', { plugins: [worldFixtures] }, async ($, on) => {
   const w = await world(on)
   await $.session.start(sessionStart())
   await w.settle()
   const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
   const buttons = (await ui.findAll({ type: 'Button' })).filter(b => String(b.props.key).startsWith('dash-tab-'))
   expect(buttons.map(b => b.props.key)).toEqual([
-    'dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-files', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-inbox', 'dash-tab-todo', 'dash-tab-improve', 'dash-tab-settings',
+    'dash-tab-overview', 'dash-tab-lanes', 'dash-tab-plan', 'dash-tab-usage', 'dash-tab-files', 'dash-tab-events', 'dash-tab-waiting', 'dash-tab-inbox', 'dash-tab-bugs', 'dash-tab-todo', 'dash-tab-improve', 'dash-tab-settings',
   ])
   expect(buttons.find(b => b.props.key === 'dash-tab-todo')?.props.hotkey).toBe('t')
   await ui.press({ key: 'dash-tab-todo' })
@@ -127,7 +128,7 @@ function barRows(buttons: readonly { props: Record<string, unknown> }[], cols: n
   return rows
 }
 
-test('P3.1: the eleven-button bar wraps cleanly at 46 and 36 columns, every hotkey distinct', { plugins: [worldFixtures] }, async ($, on) => {
+test('P3.1: the twelve-button bar wraps cleanly at 46 and 36 columns, every hotkey distinct', { plugins: [worldFixtures] }, async ($, on) => {
   const w = await world(on)
   await $.session.start(sessionStart())
   await w.settle()
@@ -135,8 +136,8 @@ test('P3.1: the eleven-button bar wraps cleanly at 46 and 36 columns, every hotk
   for (const cols of [46, 36] as const) {
     await ui.redraw(paneProps(cols))
     const bar = (await ui.findAll({ type: 'Button' })).filter(b => String(b.props.key).startsWith('dash-tab-'))
-    expect(bar).toHaveLength(11)
-    expect(bar.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'f', 'e', 'w', 'n', 't', 'i', '9'])
+    expect(bar).toHaveLength(12)
+    expect(bar.map(b => b.props.hotkey), `hotkeys at ${cols}`).toEqual(['o', 'l', 'p', 'u', 'f', 'e', 'w', 'n', 'b', 't', 'i', '9'])
     for (const row of barRows(bar, cols)) expect(row, `bar row at ${cols}`).toBeLessThanOrEqual(cols)
   }
 })
@@ -302,4 +303,44 @@ test('F1: a slug change clears the old rows, undo and error; a press before the 
     await ui.press({ key: 'dash-tab-todo' })
     await w.settle()
   }
+})
+
+test('UI.4: → bug files the todo as a bug in the same project (title one element, source todo #<id>)', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = await world(on)
+  await $.session.start(sessionStart())
+  await w.settle()
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-todo' })
+  await w.settle()
+  await ui.press({ key: 'todo-b3' })
+  await w.settle()
+  const bug = w.calls.filter(a => String(a[1] ?? '').endsWith('/scripts/mk-bug.py'))
+  expect(bug).toHaveLength(1)
+  expect(bug[0]!.slice(2)).toEqual(['--home', HOME, '--project', 'matrixkoder', 'new', '--title=third open', '--source=todo #3'])
+  expect(await ui.find({ text: /→ B7 filed from todo #3/ })).toBeTruthy()
+  expect(w.rows.map(r => r.id), 'the todo stays').toContain(3)
+})
+
+test('UI.4: the `→ bug` note goes with the next todo press and with a project change', { plugins: [worldFixtures] }, async ($, on) => {
+  const w = await world(on)
+  await $.session.start(sessionStart())
+  await w.settle()
+  const ui = await $.ui.mount({ plugin: 'matrixkoder', surface: 'terminal', component: 'Pane', requestId: 'matrixkoder', props: paneProps(46) })
+  await ui.press({ key: 'dash-tab-todo' })
+  await w.settle()
+  const note = { text: /→ B7 filed from todo #3/ }
+  await ui.press({ key: 'todo-b3' })
+  await w.settle()
+  expect(await ui.find(note)).toBeTruthy()
+  await ui.press({ key: 'todo-t3' })
+  await w.settle()
+  expect(await ui.find(note), 'a toggle clears the note').toBeUndefined()
+  await ui.press({ key: 'todo-b3' })
+  await w.settle()
+  expect(await ui.find(note)).toBeTruthy()
+  w.st.slug = 'other'
+  await ui.press({ key: 'dash-tab-overview' })
+  await ui.press({ key: 'dash-tab-todo' })
+  await w.settle()
+  expect(await ui.find(note), 'a new project clears the note').toBeUndefined()
 })

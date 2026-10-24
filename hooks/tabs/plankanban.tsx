@@ -46,6 +46,32 @@ export const STATUS_TO_COLUMN: Readonly<Record<string, PlanKanbanColumn>> = {
   merged: 'ON MAIN', done: 'ON MAIN',
 }
 
+/** Another board on the same renderer (the Bugs tab): the four column labels
+ *  (slot i of PLAN_KANBAN_COLUMNS), the status → label map, the footer, the
+ *  filter row's wording and the view-state keys. Absent = the plan's own. */
+export type KanbanConfig = {
+  readonly labels: readonly [string, string, string, string]
+  readonly statusMap: Readonly<Record<string, string>>
+  readonly footer: (shown: number) => string
+  readonly allLabel: string
+  readonly hint: string
+  readonly phaseKey: string
+  readonly taskKey: string
+}
+
+const PLAN_CONFIG: KanbanConfig = {
+  labels: PLAN_KANBAN_COLUMNS,
+  statusMap: STATUS_TO_COLUMN,
+  footer: shown => `${String(shown)} tasks · this plan only`,
+  allLabel: 'all phases',
+  hint: 'k = all runs',
+  phaseKey: 'plankanban:phase',
+  taskKey: 'plan:task',
+}
+
+/** The slot a label stands for in this board; -1 when it names none. */
+const slotOf = (config: KanbanConfig, label: string): number => config.labels.indexOf(label)
+
 /** A stored review verdict asks for changes when it is not an approve. */
 export function verdictNeedsChanges(verdict: string | null): boolean {
   if (verdict == null || verdict === '') return false
@@ -66,10 +92,12 @@ export type PlanKanbanCard = {
   readonly findings?: number
   readonly slot?: number | null
   readonly route?: PlanRoute | null
-  /** F.1 contract: derived risk (int 1-5) and its critical flag. Absent/unknown
-   *  shows nothing — never a made-up badge. */
+  /** F.1 contract: derived risk (int 1-5). Absent/unknown shows nothing — never a made-up badge. */
   readonly risk?: number
-  readonly critical?: boolean
+  /** bugs: high / med / low, drawn as a chip on the card's chip row */
+  readonly severity?: string
+  /** bugs: the dim tag line (lane, or done/total tasks) in place of lane·agent */
+  readonly note?: string
   readonly openReasons?: readonly { readonly kind: string; readonly points: number; readonly source: string; readonly opened: string }[]
 }
 
@@ -120,8 +148,8 @@ export function planKanbanView(detail: unknown, nowIso = ''): PlanKanbanView {
         verdict: verdictRaw === '' ? null : verdictRaw,
         age: ageOf(str(task.updated), nowIso),
         ...(typeof task.findings === 'number' && Number.isInteger(task.findings) && task.findings > 0 ? { findings: task.findings } : {}),
-        // routeFields already maps risk (1-5), critical and open_reasons —
-        // an old row out of the range or without them maps to absent.
+        // routeFields already maps risk (1-5) and open_reasons — an old row out of
+        // the range or without them maps to absent.
         ...routeFields(task),
       })
     }
@@ -131,9 +159,10 @@ export function planKanbanView(detail: unknown, nowIso = ''): PlanKanbanView {
 
 /** A card's column: a changes verdict wins, then the status map, then
  *  PLANNED (the unknown-status home). */
-export function columnOfTask(card: PlanKanbanCard): PlanKanbanColumn {
+export function columnOfTask(card: PlanKanbanCard, config: KanbanConfig = PLAN_CONFIG): PlanKanbanColumn {
   if (verdictNeedsChanges(card.verdict)) return 'NEEDS YOU'
-  return STATUS_TO_COLUMN[card.status] ?? 'PLANNED'
+  const label = config.statusMap[card.status]
+  return PLAN_KANBAN_COLUMNS[Math.max(0, label == null ? 0 : slotOf(config, label))] ?? 'PLANNED'
 }
 
 /** Side by side only when the pane is not NARROW and every column keeps ~14
@@ -181,11 +210,11 @@ const narrowLane = (card: PlanKanbanCard): string => {
  *  pressable and selects the task (`plan:task`; pressing the selected task
  *  again clears it). BUILDING keeps the live border, NEEDS YOU the warn
  *  border, as the mockup's `.card.live` / amber border. */
-function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: number, ui?: TabUi): RenderElement {
+function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: number, config: KanbanConfig, ui?: TabUi): RenderElement {
   const { Box, Text } = els
   const edge = col === 'BUILDING' ? { role: 'live' as const } : col === 'NEEDS YOU' ? { role: 'warn' as const } : {}
-  const full = laneAgent(card)
-  const short = narrowLane(card)
+  const full = card.note ?? laneAgent(card)
+  const short = card.note ?? narrowLane(card)
   // todo 94: never cut the tag mid-word. Two fallbacks, in order: the chip row
   // gives the tag the inner width less the phase chip (label + 2), the gap
   // before it, and the age with its gap when there is one. The full
@@ -194,14 +223,15 @@ function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: 
   // its own row (a plain Text, so the engine wraps it at word edges, never
   // mid-word). The three-part form is untouched wherever it does fit.
   // F.8: a risk badge (R1..R5, theme tokens only — ok ≤2 / idle 3 / warn ≥4,
-  // never a made-up value when the row carries none) and the critical marker.
+  // never a made-up value when the row carries none).
   // Badge cells come out of the chip row's room before the lane tag is sized.
   const riskTag = typeof card.risk === 'number' && card.risk >= 1 && card.risk <= 5 ? `R${card.risk}` : ''
   const riskRole: PaletteRole = riskTag === '' ? 'idle' : card.risk! <= 2 ? 'ok' : card.risk! >= 4 ? 'warn' : 'idle'
-  const criticalTag = card.critical === true ? '!!' : ''
   const findTag = col === 'NEEDS YOU' && card.findings != null ? `${card.findings} ${card.findings === 1 ? 'finding' : 'findings'}` : ''
-  const tagRoom = inner - (card.phase.length + 2) - 1 - (findTag !== '' ? findTag.length + 3 : 0) - (card.age !== '' ? 1 + card.age.length : 0)
-    - (riskTag !== '' ? 1 + riskTag.length : 0) - (criticalTag !== '' ? 1 + criticalTag.length : 0)
+  const sevTag = card.severity ?? ''
+  const sevRole: PaletteRole = sevTag === 'high' ? 'err' : sevTag === 'med' ? 'warn' : 'idle'
+  const tagRoom = inner - (card.phase.length + 2) - 1 - (sevTag !== '' ? sevTag.length + 3 : 0) - (findTag !== '' ? findTag.length + 3 : 0) - (card.age !== '' ? 1 + card.age.length : 0)
+    - (riskTag !== '' ? 1 + riskTag.length : 0)
   const fits = (tag: string): boolean => tag !== '' && tag.length <= tagRoom
   const rowTag = fits(full) ? full : fits(short) ? short : ''
   const ownTag = rowTag !== '' ? '' : short !== '' ? short : full
@@ -214,15 +244,15 @@ function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: 
           glyph: card.id,
           word: '',
           plain: true,
-          onPress: () => { if (ui != null) ui.set('plan:task', ui.get('plan:task') === card.id ? '' : card.id) },
+          onPress: () => { if (ui != null) ui.set(config.taskKey, ui.get(config.taskKey) === card.id ? '' : card.id) },
         })}
       </Box>
       <Text {...(col === 'ON MAIN' ? { dimColor: true } : { color: 'subtle' })} wrap="truncate-end">{cut(card.title, inner)}</Text>
       {col !== 'ON MAIN' && <Box flexDirection="row" gap={1}>
         {Chip(els, { label: card.phase, role: 'idle' })}
+        {sevTag !== '' && Chip(els, { label: sevTag, role: sevRole })}
         {col === 'NEEDS YOU' && card.findings != null && Chip(els, { label: findTag, role: 'warn' })}
-        {criticalTag !== '' && <Text color={ROLE.err.fg}>{criticalTag}</Text>}
-        {riskTag !== '' && Chip(els, { label: riskTag, role: riskRole, solid: card.critical === true })}
+        {riskTag !== '' && Chip(els, { label: riskTag, role: riskRole })}
         {rowTag !== '' && <Text dimColor={true}>{rowTag}</Text>}
         {card.age !== '' && <Text dimColor={true}>{card.age}</Text>}
       </Box>}
@@ -233,7 +263,7 @@ function planCard(els: Els, card: PlanKanbanCard, col: PlanKanbanColumn, inner: 
 
 /** One column: the Section heading with its count, then the cards — or the
  *  mockup's dim `none` when empty. `width` is the column's cell budget. */
-function planColumn(els: Els, col: PlanKanbanColumn, cards: readonly PlanKanbanCard[], width: number, fixedWidth: boolean, ui?: TabUi): RenderElement {
+function planColumn(els: Els, col: PlanKanbanColumn, cards: readonly PlanKanbanCard[], width: number, fixedWidth: boolean, config: KanbanConfig, ui?: TabUi): RenderElement {
   const { Box, Text } = els
   // a lane: its own bordered box, header (glyph + name in the column colour, count right),
   // a rule, then the cards stacked tight; an empty lane says so dimly
@@ -242,13 +272,13 @@ function planColumn(els: Els, col: PlanKanbanColumn, cards: readonly PlanKanbanC
   return (
     <Box key={col} flexDirection="column" borderStyle="round" borderColor={cards.length > 0 && col !== 'ON MAIN' && col !== 'PLANNED' ? COLUMN_FG()[col] : PALETTE.line} paddingX={1} {...(fixedWidth ? { width } : {})}>
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
-        <Text bold={true} color={COLUMN_FG()[col]}>{`${COLUMN_GLYPH[col]} ${col}`}</Text>
+        <Text bold={true} color={COLUMN_FG()[col]}>{`${COLUMN_GLYPH[col]} ${config.labels[PLAN_KANBAN_COLUMNS.indexOf(col)] ?? col}`}</Text>
         <Text color={PALETTE.mut}>{String(cards.length)}</Text>
       </Box>
       <Text color={PALETTE.line}>{'─'.repeat(ruleW)}</Text>
       {cards.length === 0
         ? <Text dimColor={true}>— nothing here</Text>
-        : cards.map(card => planCard(els, card, col, inner, ui))}
+        : cards.map(card => planCard(els, card, col, inner, config, ui))}
     </Box>
   )
 }
@@ -256,51 +286,51 @@ function planColumn(els: Els, col: PlanKanbanColumn, cards: readonly PlanKanbanC
 /** The phase filter row (spec 3): `all phases` + one Segment per phase id in
  *  plan order, selection in `plankanban:phase` (absent or '' = all), and the
  *  mockup's dim `k = all runs` hint at the right. */
-function phaseRow(els: Els, view: PlanKanbanView, phase: string, ui?: TabUi): RenderElement {
+function phaseRow(els: Els, view: PlanKanbanView, phase: string, config: KanbanConfig, ui?: TabUi): RenderElement {
   const { Box, Text } = els
   return (
     <Box flexDirection="row" justifyContent="space-between" gap={1}>
       <Box flexDirection="row" gap={1}>
         {Segment(els, {
           key: 'plankanban-phase-all',
-          label: 'all phases',
+          label: config.allLabel,
           on: phase === '',
-          onPress: () => { ui?.set('plankanban:phase', '') },
+          onPress: () => { ui?.set(config.phaseKey, '') },
         })}
         {view.phases.map(p => Segment(els, {
           key: `plankanban-phase-${p}`,
           label: p,
           on: phase === p,
-          onPress: () => { ui?.set('plankanban:phase', p) },
+          onPress: () => { ui?.set(config.phaseKey, p) },
         }))}
       </Box>
-      <Text dimColor={true}>k = all runs</Text>
+      {config.hint !== '' && <Text dimColor={true}>{config.hint}</Text>}
     </Box>
   )
 }
 
 /** Pure render: elements only, no $, no state (C1); `ui` is the C12 view state. */
-export function PlanKanbanTab(els: Els, view: PlanKanbanView, cols: number, ui?: TabUi): RenderElement {
+export function PlanKanbanTab(els: Els, view: PlanKanbanView, cols: number, ui?: TabUi, config: KanbanConfig = PLAN_CONFIG): RenderElement {
   const { Box, Text } = els
-  const phase = ui?.get('plankanban:phase') ?? ''
+  const phase = ui?.get(config.phaseKey) ?? ''
   const shown = phase === '' ? view.cards : view.cards.filter(card => card.phase === phase)
   const side = planKanbanSideBySide(cols)
   const colW = side ? Math.floor((cols - 3) / 4) : cols - 1
-  const byColumn = (col: PlanKanbanColumn): readonly PlanKanbanCard[] => shown.filter(card => columnOfTask(card) === col)
+  const byColumn = (col: PlanKanbanColumn): readonly PlanKanbanCard[] => shown.filter(card => columnOfTask(card, config) === col)
   return (
     <Box flexDirection="column" gap={1}>
-      {phaseRow(els, view, phase, ui)}
+      {phaseRow(els, view, phase, config, ui)}
       {side ? (
         <Box flexDirection="row" gap={1}>
-          {PLAN_KANBAN_COLUMNS.map(col => planColumn(els, col, byColumn(col), colW, true, ui))}
+          {PLAN_KANBAN_COLUMNS.map(col => planColumn(els, col, byColumn(col), colW, true, config, ui))}
         </Box>
       ) : (
         <Box flexDirection="column" gap={1}>
-          {PLAN_KANBAN_COLUMNS.map(col => planColumn(els, col, byColumn(col), colW, false, ui))}
+          {PLAN_KANBAN_COLUMNS.map(col => planColumn(els, col, byColumn(col), colW, false, config, ui))}
         </Box>
       )}
       <Box flexDirection="row" justifyContent="space-between" gap={1}>
-        <Text dimColor={true}>{`${shown.length} tasks · this plan only`}</Text>
+        <Text dimColor={true}>{config.footer(shown.length)}</Text>
         <Text dimColor={true}>source project</Text>
       </Box>
     </Box>

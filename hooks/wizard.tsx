@@ -400,7 +400,7 @@ const goto = ($: EngineInterface, step: number): Promise<unknown> =>
       const d = await read($, draftAtom)
       if (d.gatesFrom === '') {
         try {
-          await $.ui.focus({ requestId: WIZARD_ID, key: 'wz-gate-install' })
+          await $.ui.focus({ requestId: WIZARD_ID, key: 'wz-gate-test' })
         } catch {
           // focus refused (the site does not hold the keys) — the Input's autoFocus still seats the ring on redraw
         }

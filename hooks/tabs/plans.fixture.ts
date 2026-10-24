@@ -38,7 +38,6 @@ export const PLANS_FIXTURE: PlansView = {
       live_run: 'settings-plans-db-r1',
       counts: { tasks: 14, phases: 5 },
       mergesTo: 'main',
-      design: ['settings-tab', 'settings-wire', 'dashboard-v2', 'mk-store'],
     },
     {
       id: 'mk-bus-e2e',

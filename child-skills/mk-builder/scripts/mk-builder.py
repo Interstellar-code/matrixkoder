@@ -2535,7 +2535,9 @@ def plan_tasks_from_store(plan_id, task, data, run=None):
 def plan_tasks(plan_path, task, data=None, run=None):
     """The phase's task list: id, title, parallel, deps. From the project store's plan items when
     `plan_path` is a plan id or empty (a run started from a stored plan version), else from a plan
-    file (an older run). Empty when the plan cannot be read — connect still prints the brief."""
+    file (an older run). A file is read in the OLD TOML header shape only: a numbered-block plan
+    file is not read here — its tasks come from the store. Empty when the plan cannot be read —
+    connect still prints the brief."""
     if not plan_path or not ("/" in plan_path or plan_path.endswith(".md") or os.path.exists(plan_path)):
         return plan_tasks_from_store(plan_path, task, data, run)
     try:
@@ -5081,6 +5083,19 @@ def d7_task_msgs(data, task):
         con.close()
 
 
+def inline_plan_file(plan_id, phase_id, tasks):
+    """A minimal plan FILE in the old TOML header shape: one phase and its tasks, `tasks` is
+    [(task id, title, parallel, deps)]. `plan_tasks` reads it back from the file; a numbered-block
+    file has no such header, so its tasks come from the store and the file lists none."""
+    out = ["+++", f'plan = "{plan_id}"', "", "[[phase]]", f'id = "{phase_id}"',
+           f'title = "{phase_id} phase"']
+    for tid, title, parallel, deps in tasks:
+        out += ["", "[[phase.task]]", f'id = "{tid}"', f'title = "{title}"',
+                f"parallel = {'true' if parallel else 'false'}",
+                "deps = [" + ", ".join(f'"{d}"' for d in deps) + "]"]
+    return "\n".join(out) + "\n+++\n"
+
+
 def t_d7_connect_pages_and_tasks(root):
     """connect prints page 1 of a real-size brief and the phase task list. A brief over
     24,000 chars (a real brief, concatenated) says there is a next page."""
@@ -5095,10 +5110,8 @@ def t_d7_connect_pages_and_tasks(root):
         f.write(big)
     plan = os.path.join(root, "plan.md")
     with open(plan, "w") as f:
-        f.write('+++\nplan = "t"\nstatus = "running"\n[[phase]]\nid = "D7"\n'
-                '[[phase.task]]\nid = "D7.1"\ntitle = "connect"\nparallel = false\n'
-                'deps = []\n[[phase.task]]\nid = "D7.2"\ntitle = "ask"\n'
-                'parallel = true\ndeps = ["D7.1"]\n+++\n')
+        f.write(inline_plan_file("t", "D7", [("D7.1", "connect", False, []),
+                                               ("D7.2", "ask", True, ["D7.1"])]))
     code, lines = cli(lane, "connect", "--plan", plan)
     assert code == 0, lines
     text = "\n".join(no_path_line(lines))
@@ -5150,11 +5163,18 @@ def t_run_plan_tasks_from_the_store(root):
     assert plan_tasks("rpt", "D7", data) == got  # a phase id lists its tasks too
     assert plan_tasks("nope", "D7.1", data) == [] and plan_tasks("rpt", "ZZ.1", data) == []
     assert plan_tasks("rpt", "D7.1", os.path.join(root, "no-such-data")) == []
-    # an older run: a plan FILE path still parses the file (the old path stays)
+    # an older run: a plan FILE path still parses the file — the OLD header format stays supported
     plan = os.path.join(root, "run_pt_plan.md")
     with open(plan, "w") as f:
         f.write('+++\nplan = "t"\n[[phase]]\nid = "D7"\n[[phase.task]]\nid = "D7.1"\ntitle = "from file"\n+++\n')
     assert plan_tasks(plan, "D7.1", data) == [{"id": "D7.1", "title": "from file", "parallel": False, "deps": []}]
+    # a numbered-block plan FILE lists no tasks: its tasks come from the store, and this file
+    # keeps no second parser for that format
+    blk = os.path.join(root, "run_pt_block_plan.md")
+    with open(blk, "w") as f:
+        f.write("+++ 5.1 D7 — one phase\n### D7 — one phase\n/+++\n\n+++ 5.1.1 D7.1 — from block [toml]\n"
+                'id = "D7.1"\ntitle = "from block"\n/+++\n')
+    assert plan_tasks(blk, "D7.1", data) == []
 
 
 def t_d7b_connect_reads_the_bus_brief(root):
@@ -5335,10 +5355,8 @@ def t_l62r2_brief_counts_are_the_stored_brief_wc(root):
     begin(lane, root, run=run, task=task)
     plan = os.path.join(root, "l62r2bc-plan.md")
     with open(plan, "w") as f:
-        f.write('+++\nplan = "l62r2bc"\nstatus = "running"\n[[phase]]\nid = "L62B"\n'
-                '[[phase.task]]\nid = "L62B.1"\ntitle = "store brief"\nparallel = false\n'
-                'deps = []\n[[phase.task]]\nid = "L62B.2"\ntitle = "corrupt store"\n'
-                'parallel = true\ndeps = ["L62B.1"]\n+++\n')
+        f.write(inline_plan_file("l62r2bc", "L62B", [("L62B.1", "store brief", False, []),
+                                                       ("L62B.2", "corrupt store", True, ["L62B.1"])]))
     code, lines = cli(lane, "connect", "--data", data, "--plan", plan)
     assert code == 0, lines
     text = "\n".join(lines)
@@ -7034,9 +7052,7 @@ def t_e1_connect_fresh_lane_prints_brief(root):
     assert code == 0 and res.get("ok"), res
     plan = os.path.join(root, "e1-plan.md")
     with open(plan, "w") as f:
-        f.write('+++\nplan = "t"\nstatus = "running"\n[[phase]]\nid = "E1F"\n'
-                '[[phase.task]]\nid = "E1F.1"\ntitle = "doorbell"\nparallel = false\n'
-                'deps = []\n+++\n')
+        f.write(inline_plan_file("t", "E1F", [("E1F.1", "doorbell", False, [])]))
     env = {k: v for k, v in os.environ.items()
            if k not in ("MK_BUS_DATA", "MK_BUS_URL", "MK_BUS_TOKEN", "MK_PLAN")}
     code, lines = cli(lane, "connect", "--plan", plan, env=env)

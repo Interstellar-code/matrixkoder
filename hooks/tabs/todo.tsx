@@ -2,7 +2,8 @@
 // to-do list drawn from Todo.dc.html — header counts, the add row, filter chips,
 // the rows card, the undo line, the count line and a key hint. A pure render
 // (C10): no $, no state reads; a press only calls the `ui` callbacks the pane
-// hands in (`todoAct` for the list, `set` for the filter and the draft).
+// hands in (`todoAct` for the list, `set` for the filter and the draft). A row's
+// `→ bug` asks the pane to file the todo as a bug (plan bugs-tab, UI.4).
 import type { Elements, RenderElement } from 'claude-code'
 import { ActionButton, Card, Segment } from './kit'
 import { PALETTE, ROLE } from './palette'
@@ -27,7 +28,7 @@ export type TodoView = {
 export type TodoUi = {
   get(key: string): string | undefined
   set(key: string, value: string): void
-  todoAct?(kind: 'add' | 'toggle' | 'delete' | 'undo' | 'clear-done', arg?: string | number): void
+  todoAct?(kind: 'add' | 'toggle' | 'delete' | 'undo' | 'clear-done' | 'to-bug', arg?: string | number): void
 }
 
 /** the fixture view (the design's five sample todos). */
@@ -70,7 +71,7 @@ export function TodoTab(els: Els, view: TodoView, cols: number, ui: TodoUi): Ren
     field = <Text dimColor={true}>{clip(draft === '' ? 'press a, then type' : draft, Math.max(4, W - 11))}</Text>
   }
 
-  const textW = Math.max(1, W - 10) // `[ ]` + gap + text + gap + `✕ del`
+  const textW = Math.max(1, W - 16) // `[ ]` + gap + text + gap + `→ bug` + gap + `✕ del`
   const undoW = Math.max(1, cols - 2 - 10 - 1 - 10) // padding, `[ ↩ Undo ]`, gap, `deleted “”`
   return (
     <Box flexDirection="column">
@@ -101,6 +102,7 @@ export function TodoTab(els: Els, view: TodoView, cols: number, ui: TodoUi): Ren
             <Box key={`todo-row-${String(t.id)}`} flexDirection="row" gap={1}>
               {ActionButton(els, { key: `todo-t${String(t.id)}`, glyph: t.done ? '[✓]' : '[ ]', word: '', plain: true, tone: t.done ? 'quiet' : 'default', onPress: () => act('toggle', t.id) })}
               <Text dimColor={t.done} strikethrough={t.done}>{clip(clean(t.text), textW)}</Text>
+              {ActionButton(els, { key: `todo-b${String(t.id)}`, glyph: '→', word: 'bug', plain: true, tone: 'quiet', onPress: () => act('to-bug', t.id) })}
               {ActionButton(els, { key: `todo-x${String(t.id)}`, glyph: '✕', word: 'del', plain: true, tone: 'quiet', onPress: () => act('delete', t.id) })}
             </Box>
           ))}

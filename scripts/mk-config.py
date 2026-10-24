@@ -2,6 +2,7 @@
 """MatrixKoder config — one schema, one writer: list, get, set, migrate, context, probe. Python 3 stdlib only.
 
   list --json
+  gates [--json]
   get KEY [--set KEY=VALUE]   (--set: the caller's own value, so a draft can be read back)
   set KEY VALUE               VALUE is JSON: 12, true, "main", ["a","b"]
   set KEY VALUE --global      the same, into <home>/mk-settings.yaml (L10.3)
@@ -331,6 +332,132 @@ def agents(lines):
     ind = child_indent(lines, sr)
     return [(k, flow_map(rest)) for (i, indent, k, rest) in kl
             if sr[2] <= i < sr[3] and indent == ind and flow_map(rest)]
+
+
+# C3: the four project gate names a plan's `use` list may name. `install` and `format_changed` are
+# not gates — they change files — so an old file's lines for them are ignored here.
+GATE_NAMES = ("test", "typecheck", "lint", "build")
+# old key -> the name it reads as. A yaml written before the rename holds the lint gate as
+# `lint_changed`; it must keep working, and the next write emits the new key.
+GATE_ALIASES = {"lint_changed": "lint"}
+
+
+def gates_of(lines):
+    """-> {name: command} for the project's `gates:` block: all four names, '' when no command.
+    An old key reads as its new name (`lint_changed` as `lint`, a new key of the same name winning);
+    an old `install`/`format_changed` line is not a gate and is ignored. A file with no gates block
+    reads as four empty gates rather than failing (K7)."""
+    out = {name: "" for name in GATE_NAMES}
+    kl = key_lines(lines)
+    sr = section_range(lines, kl, ["gates"])
+    if not sr:
+        return out
+    ind = child_indent(lines, sr)
+    found = {k: scalar(rest) for (i, indent, k, rest) in kl if sr[2] <= i < sr[3] and indent == ind}
+    for old, new in GATE_ALIASES.items():
+        if found.get(new, "") == "" and old in found:
+            found[new] = found[old]
+    for name in GATE_NAMES:
+        out[name] = found.get(name, "")
+    return out
+
+
+def project_settings_readable(data=None):
+    """True if project settings YAML exists and can be read."""
+    try:
+        data = mk_state.resolve_data(data)
+        path = project_yaml_path(data)
+        return bool(path and os.path.isfile(path) and os.access(path, os.R_OK))
+    except Exception:
+        return False
+
+
+def project_gates(data=None):
+    """The {name: command} dict of gates the project defines (gates_of), read safely."""
+    try:
+        data = mk_state.resolve_data(data)
+        path = project_yaml_path(data)
+        if not path or not os.path.isfile(path):
+            return None
+        lines = read_lines(path)
+        return gates_of(lines)
+    except Exception:
+        return None
+
+
+def max_build_lanes(data=None):
+    """The integer max_build_lanes from project settings, default 3."""
+    try:
+        data = mk_state.resolve_data(data)
+        path = project_yaml_path(data)
+        if not path or not os.path.isfile(path):
+            return None
+        lines = read_lines(path)
+        load_layers(data)
+        r = row_for(lines, "routing_preferences.max_build_lanes")
+        if r:
+            _source, _found, val = resolve(lines, r)
+            if isinstance(val, int) and val > 0:
+                return val
+        return 3
+    except Exception:
+        return None
+
+
+def integration_branch(data=None):
+    """The integration_branch from project settings, default 'main'."""
+    try:
+        data = mk_state.resolve_data(data)
+        path = project_yaml_path(data)
+        if not path or not os.path.isfile(path):
+            return "main"
+        lines = read_lines(path)
+        load_layers(data)
+        r = row_for(lines, "repo.integration_branch")
+        if r:
+            _source, _found, val = resolve(lines, r)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    except Exception:
+        pass
+    return "main"
+
+
+def active_agents(home=None, data=None):
+    """The set of active/enabled agent names (from mk-catalog if present, else yaml/seeds defaults)."""
+    try:
+        home = catalog_home() if home is None else home
+        db_path = mkpaths.root_db_in(home)
+        if os.path.isfile(db_path):
+            con = mkdb._open_read(db_path, mkdb.SCHEMA)
+            if con:
+                try:
+                    has_table = con.execute("SELECT 1 FROM sqlite_master WHERE name='agents'").fetchone()
+                    if has_table:
+                        rows = con.execute("SELECT id FROM agents WHERE status='enabled'").fetchall()
+                        return {r["id"] for r in rows}
+                finally:
+                    con.close()
+    except Exception:
+        pass
+    try:
+        data = mk_state.resolve_data(data)
+        path = project_yaml_path(data)
+        if not path or not os.path.isfile(path):
+            return None
+        lines = read_lines(path)
+        active = set()
+        for name, m in agents(lines):
+            r = row_for(lines, f"agents.{name}.available")
+            avail = value_of(lines, r)[1] if r else bool(m.get("available", False))
+            if avail:
+                active.add(name)
+        if active:
+            return active
+        return {"claude", "opencode", "agy", "omp", "herdr"}
+    except Exception:
+        pass
+    return None
 
 
 def rows(lines):
@@ -1154,7 +1281,11 @@ def cmd_list(path, lines):
         if not f["editable"]:
             f["why"] = r["why"]
         fields.append(f)
-    return out({"ok": True, "file": path, "fields": fields})
+    return out({"ok": True, "file": path, "gates": gates_of(lines), "fields": fields})
+
+
+def cmd_gates(path, lines, json_mode=True):
+    return out({"ok": True, "file": path, "gates": gates_of(lines)})
 
 
 def cmd_get(path, lines, args):
@@ -1657,6 +1788,7 @@ def cmd_context(path, lines, usage_arg=None):
         "providers": val("usage.providers"),
         "launch_flags": launch_flags,
         "default_agent": val("lanes.default_agent"),
+        "gates": gates_of(lines),
         "agents": agents_map,
         "sources": sources,
     })
@@ -1912,6 +2044,8 @@ def main(argv=None):
             if "--json" not in args:
                 raise Fail("list needs --json")
             return cmd_list(path, lines)
+        if cmd == "gates":
+            return cmd_gates(path, lines, "--json" in args or not args)
         if cmd == "get":
             return cmd_get(path, lines, args)
         if cmd == "set":
@@ -1926,7 +2060,7 @@ def main(argv=None):
             return cmd_context(path, lines, usage_arg)
         if cmd == "probe":
             return cmd_probe(path, lines)
-        raise Fail("usage: mk-config.py [--data DIR] list --json | get KEY [--set KEY=VALUE] | "
+        raise Fail("usage: mk-config.py [--data DIR] list --json | gates [--json] | get KEY [--set KEY=VALUE] | "
                    "set KEY VALUE [--global] | unset KEY [--global] | migrate | migrate-settings [--dry-run] | "
                    "context [--usage PATH] | probe | [--project SLUG] | --self-test")
     except mk_state.Fail as e:  # data dir resolution failed
@@ -2606,6 +2740,36 @@ def self_test():
         with open(yaml_path, "w") as f:
             f.write(fixture)
 
+        # 28b. C3 gates reader (GATEKEY.1): the fixture's four names, an old `lint_changed` read as
+        #      `lint` (a new key of that name wins), `install`/`format_changed` ignored, and a file
+        #      with no gates block reading as four empty gates rather than failing (K7).
+        assert run("context")["gates"] == {"test": "", "typecheck": "", "lint": "", "build": ""}, run("context")
+        old_gates = fixture.replace(
+            '  lint: ""\n  build: ""\n',
+            '  lint_changed: "pnpm exec eslint ."\n  format_changed: "pnpm exec prettier --write ."\n  install: "pnpm install"\n')
+        assert old_gates != fixture
+        with open(yaml_path, "w") as f:
+            f.write(old_gates)
+        g = run("context")["gates"]
+        assert g == {"test": "", "typecheck": "", "lint": "pnpm exec eslint .", "build": ""}, g
+        both = old_gates.replace('  lint_changed:', '  lint: "pnpm exec eslint src"\n  lint_changed:')
+        with open(yaml_path, "w") as f:
+            f.write(both)
+        g = run("context")["gates"]
+        assert g["lint"] == "pnpm exec eslint src", g
+        no_gates = "".join(line + "\n" for line in fixture.splitlines()
+                           if line != "gates:" and not (line.startswith("  ") and line.split(":")[0].strip()
+                                                        in ("test", "typecheck", "lint", "build")))
+        with open(yaml_path, "w") as f:
+            f.write(no_gates)
+        assert run("context")["gates"] == {"test": "", "typecheck": "", "lint": "", "build": ""}, run("context")
+        # and the shipped template carries the four names, no old key
+        with open(os.path.join(HERE, "..", "skills", "matrixkoder", "templates", "matrixkoder.yaml")) as f:
+            templ = f.read().splitlines()
+        assert gates_of(templ) == {"test": "", "typecheck": "", "lint": "", "build": ""}, gates_of(templ)
+        with open(yaml_path, "w") as f:
+            f.write(fixture)
+
         # 29. selftest.sh: env wins; else the saved integer; garbage and a missing yaml fall back
         #     to 4. Garbage warns once. A missing yaml is silent. MATRIXKODER_DATA stays inside tmp.
         real_yaml = "/Users/rohits/Development/matrixkoder/.matrixkoder/matrixkoder.yaml"
@@ -3160,6 +3324,16 @@ def self_test():
             assert want_line in gtext, (want_line, gtext)
         again = run("--data", dc, "migrate-settings")
         assert again["carried"] == [] and again["config_json"]["carried"] == [], again
+
+        # 34. gates command & helpers
+        g_out = run("gates")
+        assert g_out["ok"] is True and "gates" in g_out
+        assert set(g_out["gates"].keys()) == set(GATE_NAMES)
+        assert project_gates(data) == g_out["gates"]
+        assert max_build_lanes(data) >= 1
+        assert isinstance(active_agents(home), set)
+        list_out = run("list", "--json")
+        assert "gates" in list_out and list_out["gates"] == g_out["gates"]
 
         # R1.2: the mkdb write guard refuses the real home from this suite too.
         import importlib.util as _iu

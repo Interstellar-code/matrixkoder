@@ -132,6 +132,14 @@ export function parseJson(text: string): unknown {
   }
 }
 
+/** The permanent per-project run that holds bug tasks: status active, no plan, never closed.
+ *  Mirrors mkdb.py BUGS_RUN / is_bugs_run. Every "the active run" pick skips it. */
+export const BUGS_RUN_ID = 'bugs'
+
+export function isBugsRun(id: unknown): boolean {
+  return typeof id === 'string' && id.toLowerCase() === BUGS_RUN_ID
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null
 }
