@@ -198,7 +198,9 @@ def check_plan_file(md, data, home, blk=None):
 
     An old-format file keeps the C2 reply as it is (seven sections, four parts). A block-format file
     is counted in blocks instead, by the same parser (CONSUM.1): `n of 9 blocks found` and the names
-    of the missing ones. `blk` is block_plan_of(text) when the caller already read it."""
+    of the missing ones. A block name the block reader found is never also named missing by the
+    check, and any missing block (or part) makes the fit `partial`, never `template`.
+    `blk` is block_plan_of(text) when the caller already read it."""
     if blk is None and os.path.isfile(md):
         blk = block_plan_of(read_text(md))
     env = dict(os.environ)
@@ -218,9 +220,15 @@ def check_plan_file(md, data, home, blk=None):
         return {"fit": "not_a_plan", "sections_found": 0, "sections_total": 7, "missing": [],
                 "note": errors[0] if errors else NOT_A_PLAN_NOTE, "errors": errors, "warnings": []}
     if blk is not None:  # the block count replaces the seven-section one, for this file only
-        # the check's own missing names (a body heading renamed inside a block, no task, no
-        # acceptance, no gate) are named alongside, deduped: nothing hides behind the count
-        missing = blk["missing"] + [m for m in (reply.get("missing") or []) if m not in blk["missing"]]
+        # The check reads the body's `## ` headings, so it can name a block the block reader
+        # found (block 4's heading is not body-parsed the same way). A block name is never
+        # both found and missing: the block reader's list is the whole truth for those nine.
+        # The check's other names (no task, no acceptance, no gate) are named alongside.
+        names = {name for _num, name in BLOCKS}
+        missing = blk["missing"] + [m for m in (reply.get("missing") or [])
+                                    if m not in blk["missing"] and m not in names]
+        if fit == "template" and missing:
+            fit = "partial"  # a missing block or part is never a clean template
         note = NOT_A_PLAN_NOTE if fit == "not_a_plan" else ""
         return {"fit": fit, "sections_found": blk["found"], "sections_total": blk["total"],
                 "missing": missing, "note": note, "errors": errors,
@@ -694,6 +702,24 @@ def self_test():
 
         partial = without_block(tpl_text, "+++ 7 Risks").replace(
             'plan = "plan-inbox-and-parsing"', 'plan = "inbox-partial"', 1)
+
+        # A1/A2: a block name is never both found and missing, and a plan missing a block is
+        # never a clean template. Both cases are checked in-process off the template text.
+        names = {name for _num, name in BLOCKS}
+        def blocks_of(text):
+            path = put("probe.md", text)
+            got = check_plan_file(path, data, home)
+            os.unlink(path)
+            return got
+        no_gates = without_block(without_block(tpl_text, "+++ 6.0 Gate settings"), "+++ 6 Gates")
+        got = blocks_of(no_gates)
+        assert got["fit"] == "partial" and got["sections_found"] + len([m for m in got["missing"] if m in names]) == 9, got
+        assert "Gates" in got["missing"] and got["sections_found"] == 8, got
+        renamed = tpl_text.replace("+++ 7 Risks", "+++ 7 Hazards", 1)
+        got = blocks_of(renamed)
+        assert got["fit"] == "partial" and "Risks" in got["missing"], got
+        assert "Hazards" not in got["missing"] and got["sections_found"] == 8, got
+        assert got["sections_found"] + len([m for m in got["missing"] if m in names]) == 9, got
         put("plan-inbox-and-parsing.md", tpl_text)
         put("inbox-partial.md", partial)
         put("ponytail-notes.md", not_text)
@@ -716,6 +742,9 @@ def self_test():
         p = by["inbox-partial.md"]
         assert p["id"] == "inbox-partial" and p["fit"] == "partial" and p["missing"] == ["Risks"], p
         assert p["sections_found"] == 8 and p["sections_total"] == 9 and p["blocks"] is True, p
+        for f in out["files"]:  # A1: a block name is found or missing, never both
+            if f["blocks"]:
+                assert f["sections_found"] + len([m for m in f["missing"] if m in names]) == 9, f
         n = by["ponytail-notes.md"]
         assert n["id"] == "mk-ponytail-hooks" and n["fit"] == "not_a_plan" and n["note"] == NOT_A_PLAN_NOTE, n  # the id is the header's, not the file name
         s = by["loose-note.md"]  # no header at all: not_a_plan, never an error, the id falls back to the file name
