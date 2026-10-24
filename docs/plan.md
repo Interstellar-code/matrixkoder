@@ -191,7 +191,7 @@ Runs as 46-column pane steps; every step pre-filled, one confirm at the end. The
 2. Data: default repo mode (`<repo>/.matrixkoder/`, added to `.gitignore`); home mode (`<globalDir>/projects/<slug>/`) is offered and is the default only for a bare repo. The data dir follows the root store's row for the repo (a migrated project writes `<project>/project.yaml`); the write creates the project store
 3. Agents: detect claude / codex / opencode / agy / herdr + model lists; tick to enable an agent, and choose whether to link the herdr plugin
 4. Usage: codexbar present? (show install cmd if not) → every enabled provider pre-selected; the z.ai key is printed as a `codexbar config set-api-key` command to run yourself, never entered here
-5. Gates: detect `install` / test / typecheck / lint / format; proposed commands are whole-repo runs (no `{paths}`/`{files}` scope — nothing expands them); baselines written null and measured at first run
+5. Gates: detect test / typecheck / lint / build (install and format are not gates; install comes from the lockfile); proposed commands are whole-repo runs (no `{paths}`/`{files}` scope — nothing expands them); baselines written null and measured at first run
 6. Routing: builder order, max lanes, the two Claude reserve floors, integration branch; `effort_by_size` and the reviewers are written as fixed defaults, never asked
 7. Autonomy: pre-authorised list, builder permission-skip flags; `pause_only_for` is a fixed eight-item default, not asked
 8. QA: frontend?, dev URL, start command (orchestrator only), themes, mockups dir, QA integration target; the port is derived from the dev URL, never asked

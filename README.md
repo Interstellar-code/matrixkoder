@@ -103,7 +103,7 @@ bash scripts/selftest.sh
 tsc -p . --noEmit
 ```
 
-Standing checks: `selftest.sh` includes the C1 gate (`python3 scripts/c1-gate.py check --baseline 0`: no MK file name spelled outside `mkpaths.py` / `hooks/paths.ts`). `python3 scripts/c1-gate.py canary` runs the rename canary: the `mkpaths.py` self-test and a full `mk-e2e-layout.py` cycle with every `MK_NAME_*` override set. `python3 scripts/mk-e2e-layout.py audit` is a read-only audit of the real home's layout and stores (each store is read from a private copy; exit 0 clean, 1 drift); the plan template ships it as an example `[[final_gate]]` that reruns after every merge.
+Standing checks: `selftest.sh` includes the C1 gate (`python3 scripts/c1-gate.py check --baseline 0`: no MK file name spelled outside `mkpaths.py` / `hooks/paths.ts`). `python3 scripts/c1-gate.py canary` runs the rename canary: the `mkpaths.py` self-test and a full `mk-e2e-layout.py` cycle with every `MK_NAME_*` override set. `python3 scripts/mk-e2e-layout.py audit` is a read-only audit of the real home's layout and stores (each store is read from a private copy; exit 0 clean, 1 drift); the plan template ships it as an example `[extra]` gate that reruns after every merge.
 
 Load the working tree with `claude --plugin-dir .`. Design and build history: `docs/plan.md`.
 
