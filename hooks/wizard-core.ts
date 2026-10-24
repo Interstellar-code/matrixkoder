@@ -22,7 +22,7 @@ export function emptyDraft(): MkWizardDraft {
     loaded: false, repo: null, slug: 'project', home: null, globalDir: null, dataEnv: null, installMode: 'dev', pluginRoot: '', version: '', branch: 'main',
     dataMode: 'repo', gitignore: true, gitignoreHas: false,
     agents, codexbarVersion: null, providersAll: [...DEFAULT_PROVIDERS], providersOn: [...DEFAULT_PROVIDERS],
-    gates: { install: '', test: '', typecheck: '', lint_changed: '', format_changed: '' }, gatesFrom: '', banned: [],
+    gates: { test: '', typecheck: '', lint: '', build: '' }, gatesFrom: '', banned: [],
     builderOrder: null, maxLanes: '3', claudeFiveHour: '40', claudeWeekly: '30',
     preauthorised: 'routing, failover, fix-loops, worktrees, lane-merges, push-non-main, open-pr',
     skipPermissions: true,
@@ -161,20 +161,21 @@ function rec(v: unknown): Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
 }
 
-type Pm = { run: string; exec: string; install: string }
+type Pm = { run: string; exec: string }
 function pmOf(locks: readonly string[]): Pm {
-  if (locks.includes('pnpm-lock.yaml')) return { run: 'pnpm run', exec: 'pnpm exec', install: 'pnpm install --frozen-lockfile --prefer-offline' }
-  if (locks.includes('yarn.lock')) return { run: 'yarn', exec: 'yarn', install: 'yarn install --frozen-lockfile' }
-  if (locks.includes('bun.lock') || locks.includes('bun.lockb')) return { run: 'bun run', exec: 'bunx', install: 'bun install --frozen-lockfile' }
-  return { run: 'npm run', exec: 'npx', install: 'npm ci' }
+  if (locks.includes('pnpm-lock.yaml')) return { run: 'pnpm run', exec: 'pnpm exec' }
+  if (locks.includes('yarn.lock')) return { run: 'yarn', exec: 'yarn' }
+  if (locks.includes('bun.lock') || locks.includes('bun.lockb')) return { run: 'bun run', exec: 'bunx' }
+  return { run: 'npm run', exec: 'npx' }
 }
 
-/** Proposes the five gate commands from what the repo declares. Never runs anything.
+/** Proposes the four gate commands from what the repo declares. Never runs anything.
+ *  Installers and formatters are not gates (C3): they change files, so neither is proposed.
  *  The proposed commands are whole-repo runs: the old `{paths}`/`{files}` scope tokens were written
  *  literally by this emitter and expanded by nobody (B-18), so a proposed gate would have run a
  *  shell that met the braces and, if it ever ran, a command named `{files}`. */
 export function proposeGates(inp: GateInputs): { gates: MkWizardGates; banned: string[]; from: string } {
-  const gates: MkWizardGates = { install: '', test: '', typecheck: '', lint_changed: '', format_changed: '' }
+  const gates: MkWizardGates = { test: '', typecheck: '', lint: '', build: '' }
   const banned: string[] = []
   const from: string[] = []
   const pkg = rec(inp.pkg)
@@ -184,7 +185,6 @@ export function proposeGates(inp: GateInputs): { gates: MkWizardGates; banned: s
     const scripts = rec(pkg.scripts)
     const deps = { ...rec(pkg.dependencies), ...rec(pkg.devDependencies) }
     const script = (n: string): string => (typeof scripts[n] === 'string' ? (scripts[n] as string) : '')
-    gates.install = pm.install
     if (script('test') !== '' || 'vitest' in deps || 'jest' in deps) {
       gates.test = 'vitest' in deps || /vitest/.test(script('test')) ? `${pm.exec} vitest run`
         : 'jest' in deps || /jest/.test(script('test')) ? `${pm.exec} jest`
@@ -192,27 +192,25 @@ export function proposeGates(inp: GateInputs): { gates: MkWizardGates; banned: s
     }
     const tc = ['typecheck', 'type-check', 'check:types', 'tsc'].find(n => script(n) !== '')
     gates.typecheck = tc ? `${pm.run} ${tc}` : inp.hasTsconfig || 'typescript' in deps ? `${pm.exec} tsc --noEmit` : ''
-    if ('eslint' in deps) gates.lint_changed = `${pm.exec} eslint .`
-    else if ('@biomejs/biome' in deps) gates.lint_changed = `${pm.exec} biome check .`
-    if ('prettier' in deps) gates.format_changed = `${pm.exec} prettier --write .`
+    if ('eslint' in deps) gates.lint = `${pm.exec} eslint .`
+    else if ('@biomejs/biome' in deps) gates.lint = `${pm.exec} biome check .`
+    if (script('build') !== '') gates.build = `${pm.run} build`
     for (const n of ['dev', 'start']) if (script(n) !== '') banned.push(`${pm.run} ${n}`)
   }
   if (inp.pyproject != null) {
     from.push('pyproject.toml')
     const py = inp.pyproject
-    if (gates.install === '') gates.install = inp.locks.includes('uv.lock') ? 'uv sync' : inp.locks.includes('poetry.lock') ? 'poetry install' : ''
     if (gates.test === '' && /pytest/.test(py)) gates.test = 'pytest'
     if (gates.typecheck === '') gates.typecheck = /mypy/.test(py) ? 'mypy .' : /pyright/.test(py) ? 'pyright' : ''
-    if (gates.lint_changed === '' && /ruff/.test(py)) gates.lint_changed = 'ruff check .'
-    if (gates.format_changed === '') gates.format_changed = /ruff/.test(py) ? 'ruff format .' : /black/.test(py) ? 'black .' : ''
+    if (gates.lint === '' && /ruff/.test(py)) gates.lint = 'ruff check .'
   }
   if (inp.makefile != null) {
     from.push('Makefile')
     const has = (t: string): boolean => new RegExp(`^${t}:`, 'm').test(inp.makefile ?? '')
     if (gates.test === '' && has('test')) gates.test = 'make test'
     if (gates.typecheck === '' && has('typecheck')) gates.typecheck = 'make typecheck'
-    if (gates.lint_changed === '' && has('lint')) gates.lint_changed = 'make lint'
-    if (gates.format_changed === '') gates.format_changed = has('fmt') ? 'make fmt' : has('format') ? 'make format' : ''
+    if (gates.lint === '' && has('lint')) gates.lint = 'make lint'
+    if (gates.build === '' && has('build')) gates.build = 'make build'
   }
   const hasProjectTest = gates.test !== ''
   // marker files fill what is still empty, so the blocks above win (a Makefile target beats Cargo)
@@ -222,18 +220,19 @@ export function proposeGates(inp: GateInputs): { gates: MkWizardGates; banned: s
     from.push('.claude-plugin/plugin.json')
     if (gates.test === '') gates.test = 'claude plugin test .'
     // the plugin schema has no whole-repo validate slot; every proposed gate is a whole-repo run
-    if (gates.lint_changed === '') gates.lint_changed = 'claude plugin validate .'
+    if (gates.lint === '') gates.lint = 'claude plugin validate .'
   }
   if (marker('Cargo.toml')) {
     from.push('Cargo.toml')
     if (gates.test === '') gates.test = 'cargo test'
-    if (gates.lint_changed === '') gates.lint_changed = 'cargo clippy'
-    if (gates.format_changed === '') gates.format_changed = 'cargo fmt'
+    if (gates.lint === '') gates.lint = 'cargo clippy'
+    if (gates.build === '') gates.build = 'cargo build'
   }
   if (marker('go.mod')) {
     from.push('go.mod')
     if (gates.test === '') gates.test = 'go test ./...'
-    if (gates.lint_changed === '') gates.lint_changed = 'go vet ./...'
+    if (gates.lint === '') gates.lint = 'go vet ./...'
+    if (gates.build === '') gates.build = 'go build ./...'
   }
   if (marker('scripts/selftest.sh') && !hasProjectTest) {
     from.push('scripts/selftest.sh')
@@ -410,11 +409,10 @@ export function buildYaml(d: MkWizardDraft, checkedAt: string, existingYaml?: st
   kv(2, 'lanes', { slots: 1, pattern: '../{repo}-mk-{n}', reuse: true }, 'reusable worktree slots; the cap is max_build_lanes')
   kv(2, 'conventions', [])
   L.push('gates:')
-  kv(2, 'install', g.install, proposed(g.install))
   kv(2, 'test', g.test, proposed(g.test))
   kv(2, 'typecheck', g.typecheck, proposed(g.typecheck))
-  kv(2, 'lint_changed', g.lint_changed, proposed(g.lint_changed))
-  kv(2, 'format_changed', g.format_changed, proposed(g.format_changed))
+  kv(2, 'lint', g.lint, proposed(g.lint))
+  kv(2, 'build', g.build, proposed(g.build))
   L.push('baselines:                            # measured at first run, refreshed each run')
   kv(2, 'type_errors', null)
   kv(2, 'lint_errors', null)
@@ -550,15 +548,19 @@ export function yamlDiff(oldText: string | null, newText: string): { rows: YamlD
 /** One drift line: the key, what the existing file says, and what detection offers instead (B-15). */
 export type DriftItem = { key: string; file: string; detected: string }
 
-/** The five gates, in the emitted order, with the yaml key each one is written under. The display name
- *  drops the `_changed` suffix the file keeps: the gate runs on changed files, and the line has 46 columns. */
+/** The four gates, in the emitted order, with the yaml key each one is written under. */
 const DRIFT_GATES: readonly (readonly [keyof MkWizardGates, string])[] = [
-  ['install', 'gates.install'],
   ['test', 'gates.test'],
   ['typecheck', 'gates.typecheck'],
-  ['lint_changed', 'gates.lint_changed'],
-  ['format_changed', 'gates.format_changed'],
+  ['lint', 'gates.lint'],
+  ['build', 'gates.build'],
 ]
+
+/** The yaml keys the gates block used to carry, new name -> old name (C3). A file written before the
+ *  rename is read through this map, so `lint_changed: ...` is the `lint` gate and not a missing one;
+ *  the next write emits the new key. `install` and `format_changed` have no new name: they were never
+ *  gates, so an old file's lines for them are ignored. */
+const GATE_KEY_ALIASES: Readonly<Record<string, string>> = { lint: 'lint_changed' }
 
 /** One scalar from a `name: value` line under a top-level block (`repo`, `gates`), or undefined when the
  *  block or the key is absent. A line-wise scan like parseCarry — no yaml library, never throws. */
@@ -601,14 +603,17 @@ function agentsIn(text: string): string[] | null {
 }
 
 /** B-15: what detection now says that the project's own file does not (display only — nothing is written
- *  and nothing is changed). Compares the five gates, `repo.integration_branch` and the enabled agents.
+ *  and nothing is changed). Compares the four gates, `repo.integration_branch` and the enabled agents.
  *  An absent existing file is no drift. A gate detected as `''` is "no command" and matches a file that
- *  says `""` too, so only a real difference is listed. */
+ *  says `""` too, so only a real difference is listed. A gate the file still holds under its old key
+ *  (`lint_changed`) reads as the new one, so a pre-rename file drifts on its value, never on the name. */
 export function driftOf(existingYamlText: string | null | undefined, d: MkWizardDraft): DriftItem[] {
   if (existingYamlText == null || existingYamlText.trim() === '') return []
   const out: DriftItem[] = []
   for (const [key, label] of DRIFT_GATES) {
+    const alias = GATE_KEY_ALIASES[key]
     const inFile = scalarUnder(existingYamlText, 'gates', key)
+      ?? (alias != null ? scalarUnder(existingYamlText, 'gates', alias) : undefined)
     if (inFile == null) continue
     const detected = d.gates[key].trim()
     // both empty is not a drift; an empty file value against a detected command (or the reverse) is

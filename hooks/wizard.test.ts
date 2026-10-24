@@ -164,32 +164,48 @@ test('parsers: which, providers, models', () => {
 test('gate proposals: pnpm+vitest, python, Makefile; never invents', () => {
   const js = proposeGates({ pkg: JSON.parse(PKG), pyproject: null, makefile: null, locks: ['pnpm-lock.yaml'], hasTsconfig: true, markers: [] })
   expect(js.gates).toEqual({
-    install: 'pnpm install --frozen-lockfile --prefer-offline',
     test: 'pnpm exec vitest run',
     typecheck: 'pnpm run typecheck',
-    lint_changed: 'pnpm exec eslint .',
-    format_changed: 'pnpm exec prettier --write .',
+    lint: 'pnpm exec eslint .',
+    build: '',
   })
   expect(js.banned).toEqual(['pnpm run dev'])
   const py = proposeGates({ pkg: null, pyproject: '[tool.pytest]\n[tool.ruff]\n[tool.mypy]', makefile: null, locks: ['uv.lock'], hasTsconfig: false, markers: [] })
-  expect(py.gates).toEqual({ install: 'uv sync', test: 'pytest', typecheck: 'mypy .', lint_changed: 'ruff check .', format_changed: 'ruff format .' })
+  expect(py.gates).toEqual({ test: 'pytest', typecheck: 'mypy .', lint: 'ruff check .', build: '' })
   const mk = proposeGates({ pkg: null, pyproject: null, makefile: 'test:\n\tgo test\nlint:\n\tvet\n', locks: [], hasTsconfig: false, markers: [] })
   expect(mk.gates.test).toBe('make test')
   expect(mk.gates.typecheck).toBe('')
   expect(proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: [] }).from).toBe('')
 })
 
+test('gate proposals: a build script, Makefile target, Cargo and go propose the build gate; an installer or formatter is never a gate', () => {
+  const withBuild = JSON.stringify({
+    scripts: { test: 'vitest run', build: 'vite build', typecheck: 'tsc --noEmit' },
+    devDependencies: { vitest: '^2', prettier: '^3' },
+  })
+  const js = proposeGates({ pkg: JSON.parse(withBuild), pyproject: null, makefile: null, locks: ['pnpm-lock.yaml'], hasTsconfig: true, markers: [] })
+  expect(js.gates.build).toBe('pnpm run build')
+  // prettier writes files, so it is not offered as a lint gate and never as a gate of its own
+  expect(js.gates.lint).toBe('')
+  const mkBuild = proposeGates({ pkg: null, pyproject: null, makefile: 'build:\n\ttsc\n', locks: [], hasTsconfig: false, markers: [] })
+  expect(mkBuild.gates.build).toBe('make build')
+  const cargo = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: ['Cargo.toml'] })
+  expect(cargo.gates.build).toBe('cargo build')
+  const go = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: ['go.mod'] })
+  expect(go.gates.build).toBe('go build ./...')
+})
+
 test('gate proposals: marker files (plugin, selftest, tsconfig-only, Cargo, go.mod)', () => {
   // this repo's shape: plugin.json + scripts/selftest.sh + tsconfig.json, no package.json
   const self = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: true, markers: ['.claude-plugin/plugin.json', 'scripts/selftest.sh'] })
   expect(self.gates).toEqual({
-    install: '', test: 'claude plugin test . && bash scripts/selftest.sh', typecheck: 'tsc -p . --noEmit',
-    lint_changed: 'claude plugin validate .', format_changed: '',
+    test: 'claude plugin test . && bash scripts/selftest.sh', typecheck: 'tsc -p . --noEmit',
+    lint: 'claude plugin validate .', build: '',
   })
   expect(self.from).toBe('.claude-plugin/plugin.json + scripts/selftest.sh + tsconfig.json')
   const plugin = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: ['.claude-plugin/plugin.json'] })
   expect(plugin.gates.test).toBe('claude plugin test .')
-  expect(plugin.gates.lint_changed).toBe('claude plugin validate .')
+  expect(plugin.gates.lint).toBe('claude plugin validate .')
   expect(plugin.from).toBe('.claude-plugin/plugin.json')
   const selftest = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: ['scripts/selftest.sh'] })
   expect(selftest.gates.test).toBe('bash scripts/selftest.sh')
@@ -198,14 +214,14 @@ test('gate proposals: marker files (plugin, selftest, tsconfig-only, Cargo, go.m
   expect(ts.gates.typecheck).toBe('tsc -p . --noEmit')
   expect(ts.from).toBe('tsconfig.json')
   const cargo = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: ['Cargo.toml'] })
-  expect(cargo.gates).toEqual({ install: '', test: 'cargo test', typecheck: '', lint_changed: 'cargo clippy', format_changed: 'cargo fmt' })
+  expect(cargo.gates).toEqual({ test: 'cargo test', typecheck: '', lint: 'cargo clippy', build: 'cargo build' })
   const go = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: ['go.mod'] })
   expect(go.gates.test).toBe('go test ./...')
-  expect(go.gates.lint_changed).toBe('go vet ./...')
+  expect(go.gates.lint).toBe('go vet ./...')
   // a Makefile target still wins over a marker stack
   const mkCargo = proposeGates({ pkg: null, pyproject: null, makefile: 'test:\n\tcargo test\n', locks: [], hasTsconfig: false, markers: ['Cargo.toml'] })
   expect(mkCargo.gates.test).toBe('make test')
-  expect(mkCargo.gates.lint_changed).toBe('cargo clippy')
+  expect(mkCargo.gates.lint).toBe('cargo clippy')
   expect(mkCargo.from).toBe('Makefile + Cargo.toml')
   // package.json keeps its own typecheck; markers add nothing (a consulted marker still lands in from, like a Makefile)
   const pkgCargo = proposeGates({ pkg: JSON.parse(PKG), pyproject: null, makefile: null, locks: [], hasTsconfig: true, markers: ['Cargo.toml'] })
@@ -215,8 +231,8 @@ test('gate proposals: marker files (plugin, selftest, tsconfig-only, Cargo, go.m
   // finding 3: selftest + Cargo gives cargo test && bash scripts/selftest.sh
   const cargoSelftest = proposeGates({ pkg: null, pyproject: null, makefile: null, locks: [], hasTsconfig: false, markers: ['scripts/selftest.sh', 'Cargo.toml'] })
   expect(cargoSelftest.gates.test).toBe('cargo test && bash scripts/selftest.sh')
-  expect(cargoSelftest.gates.lint_changed).toBe('cargo clippy')
-  expect(cargoSelftest.gates.format_changed).toBe('cargo fmt')
+  expect(cargoSelftest.gates.lint).toBe('cargo clippy')
+  expect(cargoSelftest.gates.build).toBe('cargo build')
   expect(cargoSelftest.from).toBe('Cargo.toml + scripts/selftest.sh')
   // finding 4: package.json and Makefile test stay unchanged when selftest is present
   const pkgSelftest = proposeGates({ pkg: JSON.parse(PKG), pyproject: null, makefile: null, locks: [], hasTsconfig: true, markers: ['scripts/selftest.sh'] })
@@ -274,24 +290,23 @@ test('B-19: the replace diff is a real line diff, so an insertion marks one row 
 
 test('B-15: driftOf lists a changed gate and an added agent against the file, and nothing when they agree', () => {
   const d = emptyDraft()
-  d.gates = { install: '', test: 'pnpm exec vitest run', typecheck: 'tsc -p . --noEmit', lint_changed: 'pnpm exec eslint .', format_changed: '' }
+  d.gates = { test: 'pnpm exec vitest run', typecheck: 'tsc -p . --noEmit', lint: 'pnpm exec eslint .', build: '' }
   d.branch = 'main'
   d.agents = { ...d.agents, codex: { found: true, path: '/bin/codex', enabled: true, models: [] }, agy: { found: true, path: '/bin/agy', enabled: true, models: [] } }
   const file = [
     'repo:',
     '  integration_branch: main',
     'gates:',
-    '  install: ""',
     '  test: pnpm test',
     '  typecheck: tsc -p . --noEmit',
-    '  lint_changed: pnpm exec eslint .',
-    '  format_changed: ""',
+    '  lint: pnpm exec eslint .',
+    '  build: ""',
     'agents:',
     '  codex: { available: true, models: [] }',
     '  checked_at: "2026-10-08T06:35:23.052Z"',
     '',
   ].join('\n')
-  // the test gate changed, agy is found but not in the file; the branch and the other four gates agree
+  // the test gate changed, agy is found but not in the file; the branch and the other three gates agree
   expect(driftOf(file, d)).toEqual([
     { key: 'gates.test', file: 'pnpm test', detected: 'pnpm exec vitest run' },
     { key: 'agents.agy', file: 'absent', detected: 'enabled' },
@@ -308,6 +323,41 @@ test('B-15: driftOf lists a changed gate and an added agent against the file, an
   ])
 })
 
+test('T6: an old yaml written before the gate rename reads lint_changed as lint, and drifts on its value only', () => {
+  const d = emptyDraft()
+  d.gates = { test: 'pnpm exec vitest run', typecheck: 'tsc -p . --noEmit', lint: 'pnpm exec eslint .', build: 'pnpm run build' }
+  // a file written by the pre-rename wizard: five keys, the lint one under its old name
+  const oldFile = [
+    'repo:',
+    '  integration_branch: main',
+    'gates:',
+    '  install: pnpm install --frozen-lockfile',
+    '  test: pnpm exec vitest run',
+    '  typecheck: tsc -p . --noEmit',
+    '  lint_changed: pnpm exec eslint .',
+    '  format_changed: pnpm exec prettier --write .',
+    'agents:',
+    '',
+  ].join('\n')
+  // nothing drifts on the name: the old key is the lint gate, and install/format_changed are not gates
+  expect(driftOf(oldFile, d)).toEqual([])
+  // the value does drift, reported under the new name
+  d.gates = { ...d.gates, lint: 'pnpm exec eslint src' }
+  expect(driftOf(oldFile, d)).toEqual([
+    { key: 'gates.lint', file: 'pnpm exec eslint .', detected: 'pnpm exec eslint src' },
+  ])
+  // a new-name key wins over the old one when a hand-edited file carries both
+  const both = oldFile.replace('  typecheck: tsc -p . --noEmit\n', '  typecheck: tsc -p . --noEmit\n  lint: pnpm exec eslint src\n')
+  expect(driftOf(both, d)).toEqual([])
+  // and the yaml the wizard writes carries the four names and no old key
+  const written = buildYaml(d, ISO_NOW)
+  expect(written).toContain('  lint: pnpm exec eslint src   # proposed')
+  expect(written).toContain('  build: pnpm run build   # proposed')
+  expect(written).not.toContain('lint_changed')
+  expect(written).not.toContain('format_changed')
+  expect(written).not.toContain('  install:')
+})
+
 test('baselines stay null and gates are marked proposed', () => {
   const d = emptyDraft()
   d.gates.test = 'make test'
@@ -315,7 +365,7 @@ test('baselines stay null and gates are marked proposed', () => {
   expect(yaml).toContain('baselines:')
   expect(yaml).toContain('  type_errors: null')
   expect(yaml).toContain('  test: make test   # proposed')
-  expect(yaml).toContain('  install: ""')
+  expect(yaml).toContain('  build: ""')
 })
 
 test('repo: emits the lanes block (reusable worktree slots), not worktree_pattern', () => {
@@ -350,7 +400,7 @@ test('/mk setup opens the wizard pane and detection pre-fills the draft', async 
   expect(d.providersOn).toEqual(['codex', 'claude', 'antigravity'])
   expect(d.providersAll).toEqual(['codex', 'claude', 'zai', 'antigravity'])
   expect(d.gates.test).toBe('pnpm exec vitest run')
-  expect(d.gates.install).toBe('pnpm install --frozen-lockfile --prefer-offline')
+  expect(d.gates.lint).toBe('pnpm exec eslint .')
   expect(d.gitignore).toBe(true)
   expect(d.qaFrontend).toBe(true)
   expect(d.existingYaml).toBe(false)
@@ -386,8 +436,8 @@ test('detection proposes plugin/selftest/tsconfig gates for a repo shaped like t
   await mk($, 'setup')
   const d = draftOf()
   expect(d.gates).toEqual({
-    install: '', test: 'claude plugin test . && bash scripts/selftest.sh', typecheck: 'tsc -p . --noEmit',
-    lint_changed: 'claude plugin validate .', format_changed: '',
+    test: 'claude plugin test . && bash scripts/selftest.sh', typecheck: 'tsc -p . --noEmit',
+    lint: 'claude plugin validate .', build: '',
   })
   expect(d.gatesFrom).toBe('.claude-plugin/plugin.json + scripts/selftest.sh + tsconfig.json')
 })
@@ -521,9 +571,8 @@ test('review writes yaml, registers the project (no projects.json), .gitignore a
     const yaml = files[YAML] ?? ''
     expect(yaml, surface).toContain('data_dir: .matrixkoder/')
     expect(yaml).toContain('  integration_branch: main')
-    expect(yaml).toContain('  install: pnpm install --frozen-lockfile --prefer-offline   # proposed')
     expect(yaml).toContain('  test: "pnpm exec vitest run {paths} --bail"   # proposed')
-    expect(yaml).toContain('  lint_changed: pnpm exec eslint .   # proposed')
+    expect(yaml).toContain('  lint: pnpm exec eslint .   # proposed')
     expect(yaml).toContain('  type_errors: null')
     expect(yaml).toContain('banned_commands: [pnpm run dev]')
     expect(yaml).toContain('  codex: { available: true, models: [] }')
@@ -804,13 +853,13 @@ test('gates step with nothing detected: the first gate Input takes the focus, no
   for (let i = 0; i < 4; i++) await ui.press({ key: 'wz-next' })
   expect(await ui.find({ text: /Nothing detected — Tab to a field and type the command you use\./ })).toBeTruthy()
   const inputs = await ui.findAll({ type: 'Input' })
-  expect(inputs.map(i => i.key)).toEqual(['wz-gate-install', 'wz-gate-test', 'wz-gate-typecheck', 'wz-gate-lint_changed', 'wz-gate-format_changed'])
+  expect(inputs.map(i => i.key)).toEqual(['wz-gate-test', 'wz-gate-typecheck', 'wz-gate-lint', 'wz-gate-build'])
   expect(inputs[0]?.props.autoFocus, 'the first gate Input holds the initial focus').toBe(true)
   for (const i of inputs.slice(1)) expect(i.props.autoFocus).toBeUndefined()
   const focusedButtons = (await ui.findAll({ type: 'Button' })).filter(b => b.props.autoFocus === true)
   expect(focusedButtons, 'Next is not autoFocused when nothing was detected').toEqual([])
-  await ui.input({ key: 'wz-gate-install', text: 'npm i' })
-  expect((draftOf()).gates.install).toBe('npm i')
+  await ui.input({ key: 'wz-gate-test', text: 'npm test' })
+  expect((draftOf()).gates.test).toBe('npm test')
   await ui.unmount()
 })
 
