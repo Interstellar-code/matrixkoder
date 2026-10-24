@@ -78,7 +78,7 @@ Stage 1 writes `## Routing preferences` from the project `project.yaml` defaults
 
 ## Jev recipe (cheap — every call is paid)
 
-1. Plan time: **one** `jev_classify` over all phases, size and risk as separate items. Catalog: `trivial`, `standard`, `complex_cross_cutting`, `read_only`, `reversible`, `destructive`, `manual_review`.
+1. Plan time: **one** `jev_classify` over all phases, size and risk as separate items (size: the task's own `size`, else its phase's; risk: the phase's riskiest task `risk`, 1-5). Catalog: `trivial`, `standard`, `complex_cross_cutting`, `read_only`, `reversible`, `destructive`, `manual_review`.
 2. Per phase: **one** `jev_decide` — the per-phase calls are independent, so issue them in one message as parallel tool calls, never one after another (`jev_classify` above is already one batched call). **Jev picks the route; the orchestrator supplies the menu, never the answer.** Candidates = agent + model + effort routes from the model menu (≤4, e.g. `codex gpt-6.1-sol high`, `agy gemini-3.8-flash-medium`), each described with its Jev note, spanning at least one tier below and one above your own guess and more than one agent where available, and clearly distinct (never 3+ adjacent levels of one family: Jev splits the vote between them) — plus "pause"/"wait for <agent> at <reset>" and Jev's built-in `ask_user` / `investigate`. Evidence = the phase brief verbatim + raw classify result + `mk-config.py context` fields (`agents`, `below_floor`, `policy`, `builder_order`) + `usage.json` snapshot + track record from the board (not your own size verdict). Priorities = routing preferences from `mk-config.py context` (`policy`, `builder_order`; never a size → tier mapping); when two conflict for this phase (e.g. accuracy vs Claude-sparing), state which wins. Requirements (max 3): "keeps Claude above its reserve floor", "agent not inside a reset window", "agent supports the tier".
 2a. **Default lane agent:** the default route for lane work is `lanes.default_agent` (`omp`) with its Settings pick `picks.omp`. A user-pinned route or a phase `route` wins over it; when neither is set, put that agent first in the candidate list and still call `jev_decide` — Jev decides size/effort from the candidates, the orchestrator does not decide it. If the default agent is not `available` (`agents.omp.available` false, or inside an `exhausted_until` window), drop it and run the normal Jev flow.
 3. Re-decide only on failover or a usage change. Reviewers are assigned by the rule above, not by Jev.
@@ -91,7 +91,7 @@ Stage 1 writes `## Routing preferences` from the project `project.yaml` defaults
 
 ## Review sizing
 
-Not every lane needs a separate human reviewer. Depth follows risk, and the reviewer is always a different model family than the builder where possible.
+Not every lane needs a separate human reviewer. Depth follows risk (the phase's riskiest task: `risk` 1-2 light, 3-4 standard, 5 data-loss; old plans: the phase `review` field), and the reviewer is always a different model family than the builder where possible.
 
 | Lane kind | Review depth |
 |---|---|
