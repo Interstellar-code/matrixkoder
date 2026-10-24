@@ -1,3 +1,39 @@
+# Changelog
+
+All notable changes to this project. Format: Keep a Changelog; versions: SemVer.
+
+## [0.8.0] - 2026-10-24
+
+### Added
+- **store:** store the new plan shape (bf91c10)
+- **plan:** check the new plan rules (e962865)
+- **plan:** numbered-block plan template (5ec952c)
+- **plan:** parse the numbered-block plan format (fde91aa)
+- **plan:** parse the numbered-block plan format - move self-tests to test-mk-plan.py (PARSE.1) (dcd2393)
+- **bugs:** dispatch a bug task to a lane and document bugs (342c3fe)
+- **bugs:** Bugs tab with simple, list, kanban, detail and new-bug views (e2ce605)
+- **bugs:** permanent bugs run per project, mk-bug CLI and bug drafts (ccb6e9d)
+
+### Fixed
+- **plan:** consumer review fixes (7bf2747)
+- **plan:** check review round 2 address Opus review findings (43c3e39)
+- **plan:** parse review round 4 (38dadd0)
+- **plan:** parse review round 3 address Opus review findings (4829cec)
+- **plan:** parse review round 2 address Opus review findings (78cf57a)
+- **gates:** wizard alias fallback on empty lint (aaeed01)
+- **bugs:** final-review follow-ups for dispatch, status, links and events (db70fac)
+
+### Docs
+- **plan:** finish the block-format docs (9efb64a)
+- **plan:** describe the numbered-block plan format (f5f7573)
+
+### Other
+- **plan:** migrate fixture task covers its T1 and R1 (d361c66)
+- **dashboard:** drop removed plan fields (539a255)
+- **plan:** move the plan consumers to the new format (13c9993)
+- **gates:** rename project gate names in the wizard and types (180521d)
+- **gates:** rename project gate names (b4fe975)
+
 ## [Unreleased]
 
 ### Added
