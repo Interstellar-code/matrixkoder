@@ -2,6 +2,7 @@
 """MatrixKoder config — one schema, one writer: list, get, set, migrate, context, probe. Python 3 stdlib only.
 
   list --json
+  gates [--json]
   get KEY [--set KEY=VALUE]   (--set: the caller's own value, so a draft can be read back)
   set KEY VALUE               VALUE is JSON: 12, true, "main", ["a","b"]
   set KEY VALUE --global      the same, into <home>/mk-settings.yaml (L10.3)
@@ -359,6 +360,68 @@ def gates_of(lines):
     for name in GATE_NAMES:
         out[name] = found.get(name, "")
     return out
+
+
+def project_gates(data=None):
+    """The {name: command} dict of gates the project defines (gates_of), read safely."""
+    try:
+        data = mk_state.resolve_data(data)
+        path = project_yaml_path(data)
+        lines = read_lines(path)
+        return gates_of(lines)
+    except Exception:
+        return {name: "" for name in GATE_NAMES}
+
+
+def max_build_lanes(data=None):
+    """The integer max_build_lanes from project settings, default 3."""
+    try:
+        data = mk_state.resolve_data(data)
+        path = project_yaml_path(data)
+        lines = read_lines(path)
+        load_layers(data)
+        r = row_for(lines, "routing_preferences.max_build_lanes")
+        if r:
+            _source, _found, val = resolve(lines, r)
+            if isinstance(val, int) and val > 0:
+                return val
+    except Exception:
+        pass
+    return 3
+
+
+def active_agents(home=None):
+    """The set of active/enabled agent names (from mk-catalog if present, else yaml/seeds defaults)."""
+    try:
+        home = catalog_home() if home is None else home
+        db_path = mkpaths.root_db_in(home)
+        if os.path.isfile(db_path):
+            con = mkdb._open_read(db_path, mkdb.SCHEMA)
+            if con:
+                try:
+                    has_table = con.execute("SELECT 1 FROM sqlite_master WHERE name='agents'").fetchone()
+                    if has_table:
+                        rows = con.execute("SELECT id FROM agents WHERE status='enabled'").fetchall()
+                        return {r["id"] for r in rows}
+                finally:
+                    con.close()
+    except Exception:
+        pass
+    try:
+        data = mk_state.resolve_data(None)
+        path = project_yaml_path(data)
+        lines = read_lines(path)
+        active = set()
+        for name, m in agents(lines):
+            r = row_for(lines, f"agents.{name}.available")
+            avail = value_of(lines, r)[1] if r else bool(m.get("available", False))
+            if avail:
+                active.add(name)
+        if active:
+            return active
+    except Exception:
+        pass
+    return {"claude", "opencode", "agy", "omp", "herdr"}
 
 
 def rows(lines):
@@ -1182,7 +1245,11 @@ def cmd_list(path, lines):
         if not f["editable"]:
             f["why"] = r["why"]
         fields.append(f)
-    return out({"ok": True, "file": path, "fields": fields})
+    return out({"ok": True, "file": path, "gates": gates_of(lines), "fields": fields})
+
+
+def cmd_gates(path, lines, json_mode=True):
+    return out({"ok": True, "file": path, "gates": gates_of(lines)})
 
 
 def cmd_get(path, lines, args):
@@ -1941,6 +2008,8 @@ def main(argv=None):
             if "--json" not in args:
                 raise Fail("list needs --json")
             return cmd_list(path, lines)
+        if cmd == "gates":
+            return cmd_gates(path, lines, "--json" in args or not args)
         if cmd == "get":
             return cmd_get(path, lines, args)
         if cmd == "set":
@@ -1955,7 +2024,7 @@ def main(argv=None):
             return cmd_context(path, lines, usage_arg)
         if cmd == "probe":
             return cmd_probe(path, lines)
-        raise Fail("usage: mk-config.py [--data DIR] list --json | get KEY [--set KEY=VALUE] | "
+        raise Fail("usage: mk-config.py [--data DIR] list --json | gates [--json] | get KEY [--set KEY=VALUE] | "
                    "set KEY VALUE [--global] | unset KEY [--global] | migrate | migrate-settings [--dry-run] | "
                    "context [--usage PATH] | probe | [--project SLUG] | --self-test")
     except mk_state.Fail as e:  # data dir resolution failed
@@ -3219,6 +3288,16 @@ def self_test():
             assert want_line in gtext, (want_line, gtext)
         again = run("--data", dc, "migrate-settings")
         assert again["carried"] == [] and again["config_json"]["carried"] == [], again
+
+        # 34. gates command & helpers
+        g_out = run("gates")
+        assert g_out["ok"] is True and "gates" in g_out
+        assert set(g_out["gates"].keys()) == set(GATE_NAMES)
+        assert project_gates(data) == g_out["gates"]
+        assert max_build_lanes(data) >= 1
+        assert isinstance(active_agents(home), set)
+        list_out = run("list", "--json")
+        assert "gates" in list_out and list_out["gates"] == g_out["gates"]
 
         # R1.2: the mkdb write guard refuses the real home from this suite too.
         import importlib.util as _iu

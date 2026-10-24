@@ -433,6 +433,9 @@ def _parse_toml_block(lines, start_line):
         raise Fail([f"line {line}: {e}"])
 
 
+DASH_SEP = r"(?:\s*[—–]\s*|\s+-\s+)"
+
+
 def filter_block_lines(lines):
     in_comment = False
     for line in lines:
@@ -470,6 +473,8 @@ def read_block_plan(text, sha=""):
             st = line.strip()
             if st.startswith("# "):
                 summary["title"] = st[2:].strip()
+                break
+        for line, st in filter_block_lines(b2["lines"]):
             m = re.match(r"^\s*-\s*(Phases|Method|Lanes|Delivery|Gates)\s*:\s*(.*)$", line)
             if m:
                 summary[m.group(1).lower()] = m.group(2).strip()
@@ -481,7 +486,7 @@ def read_block_plan(text, sha=""):
     if b3:
         goal_meta["raw"] = list(b3["lines"])
         for line, st in filter_block_lines(b3["lines"]):
-            m = re.match(r"^\s*-\s*(G\d+)\s*[—–-]\s*(.*)$", line)
+            m = re.match(r"^\s*-\s*(G\d+)" + DASH_SEP + r"(.*)$", line)
             if m:
                 goals.append({"id": m.group(1), "text": m.group(2).strip(), "raw": line})
                 continue
@@ -496,8 +501,8 @@ def read_block_plan(text, sha=""):
     items = []
     contracts, tests, assumptions, rollout, settings = [], [], [], [], []
     if b4:
-        for line in b4["lines"]:
-            m = re.match(r"^\s*([CTARS]\d+)\s*[—–-]\s*(.*)$", line)
+        for line, st in filter_block_lines(b4["lines"]):
+            m = re.match(r"^\s*([CTARS]\d+)" + DASH_SEP + r"(.*)$", line)
             if m:
                 item_id, item_text = m.group(1), m.group(2).strip()
                 prefix = item_id[0]
@@ -538,8 +543,8 @@ def read_block_plan(text, sha=""):
     proves_map = {}
     gate_lines = []
     if b6:
-        for line in b6["lines"]:
-            m = re.match(r"^\s*-\s*(\S+)\s*[—–-]\s*proves\s*(.*?)\s*[—–-]\s*(.*)$", line)
+        for line, st in filter_block_lines(b6["lines"]):
+            m = re.match(r"^\s*-\s*(\S+)" + DASH_SEP + r"proves\s*(.*?)" + DASH_SEP + r"(.*)$", line)
             if m:
                 gname = m.group(1).strip()
                 gproves = [p.strip() for p in m.group(2).split(",") if p.strip()]
@@ -574,7 +579,7 @@ def read_block_plan(text, sha=""):
         p_goal, p_serves, p_needs, p_build, p_hazards, p_carries = "", [], "", "", [], []
         p_raw = list(b_p["lines"]) if b_p else []
         if b_p:
-            for line in b_p["lines"]:
+            for line, st in filter_block_lines(b_p["lines"]):
                 m = re.match(r"^\s*-\s*(Goal|Serves|Needs first|Build order|Hazards|Carries)\s*:\s*(.*)$", line)
                 if m:
                     k, v = m.group(1), m.group(2).strip()
@@ -722,7 +727,9 @@ def read_block_plan(text, sha=""):
     risks = []
     if b7:
         for line, st in filter_block_lines(b7["lines"]):
-            m = re.match(r"^\s*-\s*(K\d+)\s*[—–-]\s*(.*?)\s*[—–-]\s*level\s*(\S+)\s*[—–-]\s*guard:\s*(.*?)\s*[—–-]\s*(.*?)\s*$", line)
+            if st.lower() == "none":
+                continue
+            m = re.match(r"^\s*-\s*(K\d+)" + DASH_SEP + r"(.*?)" + DASH_SEP + r"level\s*(\S+)" + DASH_SEP + r"guard:\s*(.*?)" + DASH_SEP + r"(.*?)\s*$", line)
             if m:
                 risks.append({
                     "id": m.group(1),
@@ -740,7 +747,9 @@ def read_block_plan(text, sha=""):
     questions = []
     if b8:
         for line, st in filter_block_lines(b8["lines"]):
-            m = re.match(r"^\s*-\s*\[([ xX])\]\s*(Q\d+)\s*[—–-]\s*(.*?)\s*[—–-]\s*blocks:\s*(.*?)\s*[—–-]\s*pick:\s*(.*)$", line)
+            if st.lower() == "none":
+                continue
+            m = re.match(r"^\s*-\s*\[([ xX])\]\s*(Q\d+)" + DASH_SEP + r"(.*?)" + DASH_SEP + r"blocks:\s*(.*?)" + DASH_SEP + r"pick:\s*(.*)$", line)
             if m:
                 raw_blocks = m.group(4).strip()
                 q_blocks = [] if raw_blocks.lower() == "none" else [b.strip() for b in raw_blocks.split(",") if b.strip() and b.lower() != "none"]
@@ -759,14 +768,14 @@ def read_block_plan(text, sha=""):
     b9 = block_by_name(blocks, "Log")
     log = []
     if b9:
-        for line in b9["lines"]:
-            m = re.match(r"^\s*-\s*(\S+)\s*[—–-]\s*(\S+)\s*[—–-]\s*(.*?)\s*[—–-]\s*(\S+)\s*$", line)
+        for line, st in filter_block_lines(b9["lines"]):
+            m = re.match(r"^\s*-\s*(\S+)" + DASH_SEP + r"(.*?)" + DASH_SEP + r"(.*?)" + DASH_SEP + r"(\S+)\s*$", line)
             if m:
                 log.append({
                     "date": m.group(1),
-                    "kind": m.group(2),
+                    "kind": m.group(2).strip(),
                     "text": m.group(3).strip(),
-                    "who": m.group(4),
+                    "who": m.group(4).strip(),
                     "raw": line
                 })
 
@@ -938,9 +947,10 @@ def header_parts(out):
     Phases body section."""
     phases = out["phases"]
     tasks = [t for p in phases for t in p["tasks"]]
-    fg_ok = any(isinstance(g, dict) and g.get("covers") for g in out.get("final_gates") or [])
-    if out.get("block_format") and not fg_ok:
+    if out.get("block_format"):
         fg_ok = bool(out.get("use_gates")) or bool(out.get("final_gates"))
+    else:
+        fg_ok = any(isinstance(g, dict) and g.get("covers") for g in out.get("final_gates") or [])
     return {"header phases": bool(phases), "tasks": bool(tasks),
             "acceptance": bool(tasks) and all(t["acceptance_lines"] for t in tasks),
             "final gate": fg_ok}
@@ -1009,10 +1019,294 @@ def summary_drift(out, body):
 
 
 def is_placeholder(v):
-    return isinstance(v, str) and v.startswith("<") and v.endswith(">")
+    return isinstance(v, str) and v.startswith("<")
 
 
-def check_plan(header, out, body=None):
+def is_template_plan(out):
+    if out.get("plan") == "feature-id" or is_placeholder(out.get("plan")):
+        return True
+    phases = out.get("phases") or []
+    if phases and (is_placeholder(phases[0].get("title")) or phases[0].get("title") == "<what this phase delivers, one line>"):
+        return True
+    return False
+
+
+ALLOWED_LOG_KINDS = {
+    "drafted", "decision", "answer", "override", "scope cut",
+    "approved", "amended", "parked", "resumed"
+}
+
+
+def check_settings_limits(out, data=None, home=None):
+    """The three approval-time warnings from CHECK.3:
+    - phases in one wave exceed routing_preferences.max_build_lanes
+    - phase or task route names an agent that is not active (mk-catalog)
+    - use gate is not defined by the project
+    """
+    if is_template_plan(out):
+        return []
+    warnings = []
+    phases = out.get("phases") or []
+    use_gates = out.get("use_gates") or []
+
+    # 1. max_build_lanes
+    max_lanes = mk_config.max_build_lanes(data)
+    waves = {}
+    for p in phases:
+        waves.setdefault(p.get("wave", 1), []).append(p)
+    for wave, group in sorted(waves.items()):
+        if len(group) > max_lanes:
+            warnings.append(f"wave {wave} has {len(group)} phases, exceeds max_build_lanes ({max_lanes})")
+
+    # 2. active agents
+    active = mk_config.active_agents(home)
+    for p in phases:
+        if p.get("route"):
+            agent = p["route"].split()[0]
+            if agent not in active:
+                warnings.append(f"phase {p.get('id')}: route names inactive agent {agent!r}")
+        for t in p.get("tasks", []):
+            if t.get("route"):
+                agent = t["route"].split()[0]
+                if agent not in active:
+                    warnings.append(f"task {t.get('id')}: route names inactive agent {agent!r}")
+            for s in t.get("subtasks", []):
+                if s.get("route") and isinstance(s["route"], str) and s["route"].strip():
+                    agent = s["route"].split()[0]
+                    if agent not in active:
+                        warnings.append(f"subtask {s.get('id')}: route names inactive agent {agent!r}")
+
+    # 3. use gate defined by project
+    proj_gates = mk_config.project_gates(data)
+    for g in use_gates:
+        gid = g.get("id")
+        if gid and not proj_gates.get(gid):
+            warnings.append(f"use gate {gid!r} is not defined by the project")
+
+    return warnings
+
+
+def run_start_check(out, data=None, home=None, raise_on_error=False):
+    """Turn the settings limit warnings into refusals at run start (phase RUN calls this)."""
+    refusals = check_settings_limits(out, data, home)
+    if raise_on_error and refusals:
+        raise Fail(refusals)
+    return refusals
+
+
+def check_block_plan_rules(header, out, errors, warnings, data=None, home=None):
+    """The new check rules for numbered-block plans (CHECK.2 and CHECK.3):
+    CHECK.2 (errors unless noted):
+    1. a goal no phase serves (error)
+    2. a goal no gate line proves (error)
+    3. a block-4 C/T/A/R id no task covers (error)
+    4. a task covering an id that does not exist (error)
+    5. a task covering more than 5 ids (error)
+    6. a risk whose named task has a lower risk than the risk's level (error)
+    7. a level>=3 risk whose guard names no gate and no T id (error)
+    8. a task at risk>=3 no risk line names (warning)
+    9. an unknown Log kind (error)
+    10. a Summary line whose value is off legend or disagrees with blocks 1/5/6 (warning)
+    CHECK.3 (warnings at approval):
+    11. phases in one wave exceed routing_preferences.max_build_lanes (warning)
+    12. a phase or task route names an agent that is not active (warning)
+    13. a use gate is not defined by the project (warning)
+    """
+    phases = out.get("phases") or []
+    goals = out.get("goals") or []
+    items = out.get("items") or []
+    risks = out.get("risks") or []
+    log = out.get("log") or []
+    gate_lines = out.get("gate_lines") or []
+    final_gates = out.get("final_gates") or []
+    use_gates = out.get("use_gates") or []
+
+    # 1. a goal no phase serves (error)
+    all_served = {gid for p in phases for gid in (p.get("serves") or []) if gid}
+    for g in goals:
+        gid = g.get("id")
+        text = g.get("text", "")
+        if not gid or is_placeholder(text) or is_placeholder(gid):
+            continue
+        if gid not in all_served:
+            errors.append(f"goal {gid} is served by no phase")
+
+    # 2. a goal no gate line proves (error)
+    all_proved = {gid for gl in gate_lines for gid in gl.get("proves", []) if gid}
+    for fg in final_gates:
+        for gid in fg.get("proves", []):
+            if gid:
+                all_proved.add(gid)
+    for g in goals:
+        gid = g.get("id")
+        text = g.get("text", "")
+        if not gid or is_placeholder(text) or is_placeholder(gid):
+            continue
+        if gid not in all_proved:
+            errors.append(f"goal {gid} is proved by no gate line")
+
+    # 3. a block-4 C/T/A/R id no task covers (error)
+    all_task_covered = {cid for p in phases for t in p.get("tasks", []) for cid in (t.get("covers") or []) if cid}
+    for it in items:
+        iid = it.get("id", "")
+        if not iid or iid[0] not in ("C", "T", "A", "R"):
+            continue
+        text = it.get("text", "")
+        if is_placeholder(text) or is_placeholder(iid):
+            continue
+        if iid not in all_task_covered:
+            errors.append(f"block 4 item {iid} is covered by no task")
+
+    # 4. a task covering an id that does not exist (error)
+    # 5. a task covering more than 5 ids (error)
+    all_block4_ids = {it.get("id") for it in items if it.get("id")}
+    for p in phases:
+        for t in p.get("tasks", []):
+            tid = t.get("id") or "task"
+            covers = t.get("covers") or []
+            if len(covers) > 5:
+                errors.append(f"{tid}: covers {len(covers)} ids (max 5)")
+            for cid in covers:
+                if is_placeholder(cid):
+                    continue
+                if cid not in all_block4_ids:
+                    errors.append(f"{tid}: covers {cid!r} which does not exist in block 4")
+
+    # 6. a risk whose named task has a lower risk than the risk's level (error)
+    # 7. a level>=3 risk whose guard names no gate and no T id (error)
+    task_by_id = {t["id"]: t for p in phases for t in p.get("tasks", []) if t.get("id")}
+    phase_by_id = {p["id"]: p for p in phases if p.get("id")}
+    use_names = [g["id"] for g in use_gates if g.get("id")]
+    final_names = [g["id"] for g in final_gates if g.get("id")]
+    gate_line_names = [gl["name"] for gl in gate_lines if gl.get("name")]
+    all_gate_identifiers = set(use_names + final_names + gate_line_names + ["test", "typecheck", "lint", "build", "selftest"])
+
+    for r in risks:
+        rid = r.get("id") or "risk"
+        lvl = r.get("level")
+        target = r.get("target", "").strip()
+        guard = r.get("guard", "").strip()
+        if is_placeholder(target) or is_placeholder(guard):
+            continue
+        if isinstance(lvl, int):
+            if target in task_by_id:
+                t_risk = task_by_id[target].get("risk", 1)
+                if t_risk < lvl:
+                    errors.append(f"risk {rid}: task {target} risk ({t_risk}) is lower than risk level ({lvl})")
+            elif target in phase_by_id:
+                p_tasks = phase_by_id[target].get("tasks", [])
+                max_risk = max((t.get("risk", 1) for t in p_tasks), default=1)
+                if max_risk < lvl:
+                    errors.append(f"risk {rid}: phase {target} riskiest task ({max_risk}) is lower than risk level ({lvl})")
+
+            # 7. level >= 3 guard check
+            if lvl >= 3:
+                has_t = bool(re.search(r"\bT\d+\b", guard))
+                has_gate_word = bool(re.search(r"\bgate\b", guard, re.I))
+                has_known_gate = any(re.search(r"\b" + re.escape(gn) + r"\b", guard, re.I) for gn in all_gate_identifiers if gn)
+                has_task_gate = False
+                if target in task_by_id:
+                    t = task_by_id[target]
+                    if t.get("gate") or t.get("manual"):
+                        if "self-test" in guard.lower() or "selftest" in guard.lower():
+                            has_task_gate = True
+                if not (has_t or has_gate_word or has_known_gate or has_task_gate):
+                    errors.append(f"risk {rid}: level {lvl} risk guard {guard!r} names no gate and no T id")
+
+    # 8. a task at risk>=3 no risk line names (warning)
+    risk_targets = {r.get("target", "").strip() for r in risks if r.get("target")}
+    for p in phases:
+        for t in p.get("tasks", []):
+            tid = t.get("id")
+            t_risk = t.get("risk", 1)
+            if isinstance(t_risk, int) and t_risk >= 3:
+                if is_template_plan(out) or is_placeholder(t.get("title")) or is_placeholder(tid):
+                    continue
+                if tid not in risk_targets and p.get("id") not in risk_targets:
+                    warnings.append(f"task {tid}: risk {t_risk} >= 3 is named by no risk line")
+
+    # 9. an unknown Log kind (error)
+    for entry in log:
+        kind = entry.get("kind", "").strip()
+        if is_placeholder(kind):
+            continue
+        if kind not in ALLOWED_LOG_KINDS:
+            errors.append(f"log: unknown kind {kind!r} (allowed: {', '.join(sorted(ALLOWED_LOG_KINDS))})")
+
+    # 10. Summary line checks (warning)
+    sum_dict = out.get("summary") or {}
+    raw_phases_sum = sum_dict.get("phases", "").strip()
+    if raw_phases_sum and not raw_phases_sum.startswith("<"):
+        m_ph = re.match(r"^(\d+)" + DASH_SEP + r"(.*)$", raw_phases_sum)
+        if not m_ph:
+            warnings.append(f"Summary Phases value off legend: {raw_phases_sum!r}")
+        else:
+            cnt = int(m_ph.group(1))
+            if cnt != len(phases):
+                warnings.append(f"Summary says {cnt} phases; the plan has {len(phases)}")
+            rest = m_ph.group(2)
+            for p in phases:
+                pid = p.get("id")
+                if pid and not re.search(r"(?<![\w-])" + re.escape(pid) + r"(?![\w-])", rest):
+                    warnings.append(f"Summary Phases does not list phase {pid}")
+
+    raw_meth = sum_dict.get("method", "").strip()
+    if raw_meth and not raw_meth.startswith("<"):
+        m_meth = re.match(r"^(waves|single lane)\s*·\s*subagents\s+(on|off|mixed)$", raw_meth, re.I)
+        if not m_meth:
+            warnings.append(f"Summary Method value off legend: {raw_meth!r}")
+        elif phases:
+            waves_exp = "waves" if len({repr(p.get("wave", 1)) for p in phases}) > 1 else "single lane"
+            subs_exp_set = {bool(p.get("subagents")) for p in phases}
+            subs_exp = "mixed" if len(subs_exp_set) > 1 else ("on" if True in subs_exp_set else "off")
+            got_waves = m_meth.group(1).lower()
+            got_subs = m_meth.group(2).lower()
+            if (got_waves, got_subs) != (waves_exp, subs_exp):
+                warnings.append(f"Summary Method says {got_waves} · subagents {got_subs}; "
+                                f"the plan says {waves_exp} · subagents {subs_exp}")
+
+    raw_lanes = sum_dict.get("lanes", "").strip()
+    if raw_lanes and not raw_lanes.startswith("<"):
+        for g in sorted({p["lane_group"] for p in phases if p.get("lane_group")}):
+            if not re.search(r"(?<![\w-])" + re.escape(g) + r"(?![\w-])", raw_lanes):
+                warnings.append(f"Summary Lanes does not name lane_group {g}")
+        for p in phases:
+            pid = p.get("id")
+            if pid and not p.get("lane_group"):
+                if not re.search(r"(?<![\w-])" + re.escape(pid) + r"(?![\w-])", raw_lanes):
+                    warnings.append(f"Summary Lanes does not list phase {pid}")
+
+    raw_deliv = sum_dict.get("delivery", "").strip()
+    if raw_deliv and not raw_deliv.startswith("<"):
+        m_deliv = re.match(r"^(.*?)\s*·\s*pushed:\s*(yes|no)$", raw_deliv, re.I)
+        if not m_deliv:
+            warnings.append(f"Summary Delivery value off legend: {raw_deliv!r}")
+        else:
+            branch = m_deliv.group(1).strip()
+            pushed_str = m_deliv.group(2).lower()
+            exp_branch = str(out.get("integration") or "main")
+            exp_pushed = "yes" if out.get("pushed") else "no"
+            if branch != exp_branch:
+                warnings.append(f"Summary Delivery branch says {branch!r}; block 1 says {exp_branch!r}")
+            if pushed_str != exp_pushed:
+                warnings.append(f"Summary Delivery pushed says {pushed_str!r}; block 1 says {exp_pushed!r}")
+
+    raw_gates = sum_dict.get("gates", "").strip()
+    if raw_gates and not raw_gates.startswith("<"):
+        for un in use_names:
+            if not re.search(r"(?<![\w-])" + re.escape(un) + r"(?![\w-])", raw_gates):
+                warnings.append(f"Summary Gates does not list use gate {un}")
+        for fg in final_gates:
+            fid = fg.get("id")
+            if fid and not re.search(r"(?<![\w-])" + re.escape(fid) + r"(?![\w-])", raw_gates):
+                warnings.append(f"Summary Gates does not list extra gate {fid}")
+
+    # CHECK.3 limits warnings
+    limit_warns = check_settings_limits(out, data, home)
+    warnings.extend(limit_warns)
+
+
+def check_plan(header, out, body=None, data=None, home=None):
     """→ (errors, warnings). Errors are exactly the P1.2 contract rules; anything
     advisory (cross-run deps, malformed id shapes) is a warning. `body` is the markdown
     below the closing +++ when the caller has it: the T1 header-key gaps are warnings
@@ -1065,7 +1359,7 @@ def check_plan(header, out, body=None):
     # TPL.2: a plan created on or after NEW_PLAN_FROM gets the REQUIRED keys as errors; an older or
     # undated plan only a warning
     strict = errors if is_new_plan(header) else warnings
-    if body is not None:
+    if body is not None and not out.get("block_format"):
         secs = body_sections(body)
         for name in ("Summary", "Goal"):
             if not secs[name]:
@@ -1130,7 +1424,7 @@ def check_plan(header, out, body=None):
                 strict.append(f"{tid}: no title key (required in a plan created on or after {NEW_PLAN_FROM})")
             if not t["acceptance_lines"]:
                 warnings.append(f"{tid}: no acceptance")
-            elif any(isinstance(g, dict) for g in t["gate"]):
+            elif not out.get("block_format") and any(isinstance(g, dict) for g in t["gate"]):
                 proved = {str(x) for g in t["gate"] if isinstance(g, dict) and isinstance(g.get("lines"), list)
                           for x in g["lines"]}
                 loose = [ln["id"] for ln in t["acceptance_lines"] if ln["id"] not in proved]
@@ -1161,26 +1455,6 @@ def check_plan(header, out, body=None):
                 if clash:
                     errors.append(f"{pid}: subagent tasks {subs[i]['id']} and {subs[j]['id']} share a file ({clash})")
 
-    waves = {}
-    for p in phases:
-        waves.setdefault(p["wave"], []).append(p)
-    for wave in sorted(waves):
-        group = waves[wave]
-        for i in range(len(group)):
-            for j in range(i + 1, len(group)):
-                clash = owned_clash(group[i]["owned"], group[j]["owned"])
-                if clash:
-                    errors.append(f"wave {wave}: {group[i]['id']} and {group[j]['id']} both own {clash}")
-
-    lanes = {}
-    for p in phases:
-        if p["lane_group"]:
-            lanes.setdefault(p["lane_group"], []).append(p)
-    for g, group in sorted(lanes.items()):
-        ws = sorted({p["wave"] for p in group})
-        if len(ws) > 1:
-            errors.append(f"lane_group {g}: phases in different waves ({', '.join(str(w) for w in ws)})")
-
     # same graph validate_tree walks: phases, tasks and subtasks, keyed by id.
     # a cross-run dep (<run>:<id>) is not an edge here — check cannot see the other run —
     # and stays the warning recorded above. a self-dep is its own one-node cycle.
@@ -1198,7 +1472,48 @@ def check_plan(header, out, body=None):
     cycle = find_cycle(nodes)
     if cycle:
         errors.append("dep cycle: " + " -> ".join(cycle))
+
+    def has_dep_path(start, target):
+        visited = set()
+        queue = [start]
+        while queue:
+            curr = queue.pop(0)
+            if curr == target:
+                return True
+            if curr in visited:
+                continue
+            visited.add(curr)
+            for dep in nodes.get(curr, []):
+                if dep not in visited:
+                    queue.append(dep)
+        return False
+
+    waves = {}
+    for p in phases:
+        waves.setdefault(p["wave"], []).append(p)
+    for wave in sorted(waves):
+        group = waves[wave]
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                # Q8: if one phase depends on the other, the dependency orders them
+                if has_dep_path(group[j]["id"], group[i]["id"]) or has_dep_path(group[i]["id"], group[j]["id"]):
+                    continue
+                clash = owned_clash(group[i]["owned"], group[j]["owned"])
+                if clash:
+                    errors.append(f"wave {wave}: {group[i]['id']} and {group[j]['id']} both own {clash}")
+
+    lanes = {}
+    for p in phases:
+        if p["lane_group"]:
+            lanes.setdefault(p["lane_group"], []).append(p)
+    for g, group in sorted(lanes.items()):
+        ws = sorted({p["wave"] for p in group})
+        if len(ws) > 1:
+            errors.append(f"lane_group {g}: phases in different waves ({', '.join(str(w) for w in ws)})")
+
     check_gate_fields(out, errors, warnings)
+    if out.get("block_format"):
+        check_block_plan_rules(header, out, errors, warnings, data=data, home=home)
     return errors, warnings
 
 
@@ -1220,12 +1535,17 @@ def check_gate_fields(out, errors, warnings):
     task_ids = [tid for t, tid in items if tid]
     for t, tid in items:
         rid = tid or "task"
+        risk = t.get("risk", 1)
         gates = t.get("gate") or []
         manual = t.get("manual", "")
         if gates and manual:
             errors.append(f"{rid}: gate and manual are exclusive; pick one")
         elif not gates and not manual:
-            warnings.append(f"{rid}: neither gate nor manual line")
+            if not out.get("block_format"):
+                warnings.append(f"{rid}: neither gate nor manual line")
+            else:
+                if risk >= 3:
+                    errors.append(f"{rid}: risk {risk} requires a gate or manual")
         lines = {ln["id"] for ln in t.get("acceptance_lines") or []}
         for i, g in enumerate(gates):
             glabel = f"{tid} gate" if len(gates) == 1 else f"{rid} gate {i + 1}"
@@ -1246,7 +1566,6 @@ def check_gate_fields(out, errors, warnings):
             for lid in glines:
                 if str(lid) not in lines:
                     errors.append(f"{glabel}: lines id {lid!r} is not an acceptance line of {rid}")
-        risk = t.get("risk", 1)
         if type(risk) is not int or isinstance(risk, bool) or not 1 <= risk <= 5:
             errors.append(f"{rid}: risk {risk!r} is not an int 1-5")
     # F.2 header [[final_gate]] blocks. F.0's [gates] tables and string gates are checked above,
@@ -1273,8 +1592,11 @@ def check_gate_fields(out, errors, warnings):
         for cid in covers:
             if str(cid) not in task_ids:
                 errors.append(f"{label}: covers {cid!r} is not a task in this plan")
-    if not finals:
-        if not (out.get("block_format") and (out.get("use_gates") or out.get("final_gates"))):
+    if not out.get("block_format"):
+        if not finals:
+            warnings.append("no final_gate in the plan: F.2 wants one plan-level gate with covers")
+    else:
+        if not out.get("use_gates") and not finals:
             warnings.append("no final_gate in the plan: F.2 wants one plan-level gate with covers")
 
 
@@ -1460,7 +1782,7 @@ def cmd_check(a):
     text, _ = load(a.path)
     _lines, close = split_plan(text)
     body = body_md_of(text, close)
-    errors, warnings = check_plan(header, out, body)
+    errors, warnings = check_plan(header, out, body, data=a.data, home=a.home)
     cls = classify(out, body)
     if errors:
         raise Fail(errors, warnings=warnings, **(cls if a.classify else {}))
@@ -2070,7 +2392,7 @@ def approve_file(path, data, home, run, user_ack=None):
     skill."""
     data = resolve_data_arg(data)
     header, out, sha = read_plan(path)
-    errors, warnings = check_plan(header, out)
+    errors, warnings = check_plan(header, out, data=data, home=home)
     if errors:
         raise Fail(errors, warnings=warnings)
     text, _ = load(path)

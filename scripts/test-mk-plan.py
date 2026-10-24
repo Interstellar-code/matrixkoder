@@ -108,7 +108,7 @@ def self_test():
         # only the fixture plan-link.md — which is NOT part of this change and stays as it is —
         # is allowed to carry them.
         out = mk("check", template)
-        assert out["ok"] and f2_warnings(out["warnings"]) == [] and out["sha"], out.get("warnings")
+        assert out["ok"] and out["warnings"] == [] and out["sha"], out.get("warnings")
         out = mk("check", real_plan)
         assert out["ok"] and out["sha"] and f2_warnings(out["warnings"]) == [], out["plan"]
         assert any("no final_gate in the plan" in w for w in out["warnings"])  # the F.2 advisory
@@ -416,7 +416,7 @@ def self_test():
         # the shipped template is the contract: it names every key's home and checks with
         # no new warning (the whole set above is empty for it)
         out = mk("check", template)
-        assert out["ok"] and f2_warnings(out["warnings"]) == [], out
+        assert out["ok"] and out["warnings"] == [], out
         with open(template, encoding="utf-8") as fh:
             tmpl = fh.read()
         assert tmpl.startswith("+++ 1 Top block")
@@ -427,9 +427,8 @@ def self_test():
         p0 = out["phases"][0]
         assert p0["tasks"][0]["gate"] and p0["tasks"][0]["acceptance_lines"] \
             and len(p0["tasks"][0]["acceptance_lines"]) == 2, p0["tasks"][0]
-        assert out.get("use_gates") or (out.get("final_gates") and out["final_gates"][0]["covers"]), out
-        if out.get("use_gates"):
-            assert [g["id"] for g in out["use_gates"]] == ["test", "typecheck"]
+        assert out.get("use_gates")
+        assert [g["id"] for g in out["use_gates"]] == ["test", "typecheck"]
 
         # F0-BLOCK-BEGIN — F.0: a table gate is runnable, a plain string gate stays manual
         p = write("gate-table.md", plan_text(head_extra=(
@@ -1745,7 +1744,7 @@ manual = "tested by hand"
         assert out_low8["warnings"] == []
         assert [g["id"] for g in out_low8["use_gates"]] == ["test", "typecheck"]
 
-        # Test LOW 9: task with no gate and no manual warns 'neither gate nor manual line' regardless of risk level
+        # Test LOW 9: task with risk 1 needs no gate in block format; risk >= 3 requires gate or manual
         bp_low9 = write("test-low9.md", """+++ 1 Top block [toml]
 plan = "low9"
 status = "draft"
@@ -1776,7 +1775,39 @@ risk = 1
 /+++
 """)
         out_low9 = mk("check", bp_low9)
-        assert any("neither gate nor manual line" in w for w in out_low9["warnings"]), out_low9["warnings"]
+        assert not any("neither gate nor manual line" in w for w in out_low9["warnings"]), out_low9["warnings"]
+
+        bp_low9_err = write("test-low9-err.md", """+++ 1 Top block [toml]
+plan = "low9-err"
+status = "draft"
+created = "2026-10-24"
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1
+- Goal: P1
+/+++
+
++++ 5.1.0 P1 settings [toml]
+id = "P1"
+title = "P1"
+wave = 1
+owned = ["a.py"]
+commit = "feat: p1"
+/+++
+
++++ 5.1.1 P1.1 task [toml]
+id = "P1.1"
+title = "T1"
+acceptance = "a1"
+risk = 3
+/+++
+""")
+        chk_low9 = mk("check", bp_low9_err, code=2)
+        assert any("risk 3 requires a gate or manual" in e for e in chk_low9["errors"]), chk_low9["errors"]
 
         # Test LOW 10: none in Hazards/Carries/blocks -> []; gate_lines key; phase raw text; warn on patternless lines
         bp_low10 = write("test-low10.md", """+++ 1 Top block [toml]
@@ -1965,6 +1996,389 @@ test = "pytest plugins"
         assert "test" in [g["id"] for g in out_use_extra["final_gates"]]
         assert "test" not in [g["id"] for g in out_use_extra["use_gates"]]
         assert [g["id"] for g in out_use_extra["use_gates"]] == ["typecheck"]
+
+        # =========================================================================
+        # PHASE CHECK: CHECK.1, CHECK.2, CHECK.3 tests
+        # =========================================================================
+
+        # 1. Clean filled plan check (scripts/fixtures/plan-blocks.md)
+        plan_blocks_path = os.path.join(root, "scripts", "fixtures", "plan-blocks.md")
+        chk_filled = mk("check", plan_blocks_path)
+        assert chk_filled["ok"] is True, chk_filled
+        assert chk_filled.get("errors", []) == []
+        assert chk_filled["fit"] == "template"
+
+        def make_base_plan(
+            plan_id="clean-test-plan",
+            summary_phases="1 — P1: Phase One",
+            summary_method="single lane · subagents off",
+            summary_lanes="P1 (own lane)",
+            summary_delivery="main · pushed: no",
+            summary_gates="test; typecheck",
+            goals="  - G1 — First goal checkable outcome",
+            contracts="C1 — contract description — written by P1.1",
+            tests="T1 — test description — unit — tests.py — written by P1.1",
+            assumptions="A1 — assumption text — fallback",
+            rollout="R1 — rollout text — P1.1",
+            settings="S1 — setting text — val — file — 2026-10-24",
+            phase_serves="G1",
+            phase_carries="C1, T1, A1, R1",
+            phase_wave=1,
+            phase_route="",
+            phase_subagents="false",
+            phase_lane_group="",
+            phase_extra="",
+            task_covers='["C1", "T1", "A1", "R1"]',
+            task_risk=1,
+            task_route="",
+            task_gate="",
+            task_extra="",
+            extra_phases="",
+            gate_lines="- test — proves G1 — test line\n- typecheck — proves G1 — typecheck line",
+            use_gates='["test", "typecheck"]',
+            extra_gates="",
+            risks="none",
+            questions="none",
+            log="- 2026-10-24 — drafted — clean plan drafted — tester",
+        ):
+            b_gate = f'\ngate = "{task_gate}"' if task_gate else ""
+            b_route = f'\nroute = "{task_route}"' if task_route else ""
+            b_proute = f'\nroute = "{phase_route}"' if phase_route else ""
+            b_plg = f'\nlane_group = "{phase_lane_group}"' if phase_lane_group else ""
+            extra_g_section = f"\n[extra]\n{extra_gates}" if extra_gates else ""
+            return f"""+++ 1 Top block [toml]
+plan = "{plan_id}"
+status = "draft"
+created = "2026-10-24"
+/+++
+
++++ 2 Summary
+# {plan_id} — Deliverable
+
+## Summary
+- Phases: {summary_phases}
+- Method: {summary_method}
+- Lanes: {summary_lanes}
+- Delivery: {summary_delivery}
+- Gates: {summary_gates}
+/+++
+
++++ 3 Goal
+## Goal
+- Done when:
+{goals}
+- Why: clean plan test
+- From: unit test
+- Sources: none
+/+++
+
++++ 4 Design / context
+## Design / context
+### Contracts
+{contracts}
+### Test plan
+{tests}
+### Assumptions and dependencies
+{assumptions}
+### Rollout and undo
+{rollout}
+### Settings and limits
+{settings}
+/+++
+
++++ 5 Phases
+## Phases
+/+++
+
++++ 5.1 P1 — Phase One
+### P1 — Phase One
+- Goal: P1 goal
+- Serves: {phase_serves}
+- Needs first: nothing
+- Build order: P1.1
+- Hazards: none
+- Carries: {phase_carries}
+/+++
+
++++ 5.1.0 P1 settings [toml]
+id = "P1"
+title = "Phase One"
+wave = {phase_wave}
+owned = ["src/"]
+commit = "feat: phase one"
+subagents = {phase_subagents}{b_proute}{b_plg}
+{phase_extra}/+++
+
++++ 5.1.1 P1.1 — Task One [toml]
+id = "P1.1"
+title = "Task One"
+covers = {task_covers}
+acceptance = ["outcome one"]
+risk = {task_risk}{b_gate}{b_route}
+{task_extra}/+++
+{extra_phases}
++++ 6 Gates
+## Gates
+{gate_lines}
+/+++
+
++++ 6.0 Gate settings [toml]
+use = {use_gates}
+{extra_g_section}/+++
+
++++ 7 Risks
+## Risks
+{risks}
+/+++
+
++++ 8 Open questions
+## Open questions
+{questions}
+/+++
+
++++ 9 Log
+## Log
+{log}
+/+++
+"""
+
+        # Verify make_base_plan produces clean check
+        clean_file = write("test-clean-base.md", make_base_plan())
+        chk_base = mk("check", clean_file)
+        assert chk_base["ok"] is True, chk_base
+        assert chk_base.get("errors", []) == []
+
+        # Rule 1: goal no phase serves
+        p_g_noserve = write("test-goal-no-phase.md", make_base_plan(
+            goals="  - G1 — Goal 1\n  - G2 — Goal 2",
+            phase_serves="G1",
+        ))
+        chk_g_noserve = mk("check", p_g_noserve, code=2)
+        assert chk_g_noserve["ok"] is False
+        assert any("goal G2 is served by no phase" in e for e in chk_g_noserve["errors"]), chk_g_noserve
+
+        # Rule 2: goal no gate line proves
+        p_g_noproove = write("test-goal-no-gate.md", make_base_plan(
+            goals="  - G1 — Goal 1\n  - G2 — Goal 2",
+            phase_serves="G1, G2",
+            gate_lines="- test — proves G1 — test line\n- typecheck — proves G1 — typecheck line",
+        ))
+        chk_g_noproove = mk("check", p_g_noproove, code=2)
+        assert chk_g_noproove["ok"] is False
+        assert any("goal G2 is proved by no gate line" in e for e in chk_g_noproove["errors"]), chk_g_noproove
+
+        # Rule 3: block-4 C/T/A/R id no task covers (S id is excluded)
+        p_b4_uncovered = write("test-b4-uncovered.md", make_base_plan(
+            contracts="C1 — contract description — written by P1.1\nC2 — second contract — written by P1.1",
+            task_covers='["C1", "T1", "A1", "R1"]',
+        ))
+        chk_b4_uncovered = mk("check", p_b4_uncovered, code=2)
+        assert chk_b4_uncovered["ok"] is False
+        assert any("block 4 item C2 is covered by no task" in e for e in chk_b4_uncovered["errors"]), chk_b4_uncovered
+
+        # Rule 4: task covering an id that does not exist in block 4
+        p_covers_nonexist = write("test-covers-missing.md", make_base_plan(
+            task_covers='["C1", "T1", "A1", "R1", "C99"]',
+        ))
+        chk_covers_nonexist = mk("check", p_covers_nonexist, code=2)
+        assert chk_covers_nonexist["ok"] is False
+        assert any("covers 'C99' which does not exist in block 4" in e for e in chk_covers_nonexist["errors"]), chk_covers_nonexist
+
+        # Rule 5: task covering more than 5 ids
+        p_covers_over5 = write("test-covers-over5.md", make_base_plan(
+            contracts="C1 — c1 — P1.1\nC2 — c2 — P1.1\nC3 — c3 — P1.1\nC4 — c4 — P1.1\nC5 — c5 — P1.1\nC6 — c6 — P1.1",
+            task_covers='["C1", "C2", "C3", "C4", "C5", "C6"]',
+        ))
+        chk_covers_over5 = mk("check", p_covers_over5, code=2)
+        assert chk_covers_over5["ok"] is False
+        assert any("covers 6 ids (max 5)" in e for e in chk_covers_over5["errors"]), chk_covers_over5
+
+        # Rule 6: risk whose named task has a lower risk than risk level
+        p_risk_lower = write("test-risk-lower.md", make_base_plan(
+            task_risk=2,
+            risks="- K1 — danger — level 4 — guard: T1 — P1.1",
+        ))
+        chk_risk_lower = mk("check", p_risk_lower, code=2)
+        assert chk_risk_lower["ok"] is False
+        assert any("task P1.1 risk (2) is lower than risk level (4)" in e for e in chk_risk_lower["errors"]), chk_risk_lower
+
+        # Rule 6 (phase): risk whose named phase riskiest task has lower risk than risk level
+        p_risk_lower_phase = write("test-risk-lower-phase.md", make_base_plan(
+            task_risk=2,
+            risks="- K1 — danger — level 4 — guard: T1 — P1",
+        ))
+        chk_risk_lower_phase = mk("check", p_risk_lower_phase, code=2)
+        assert chk_risk_lower_phase["ok"] is False
+        assert any("phase P1 riskiest task (2) is lower than risk level (4)" in e for e in chk_risk_lower_phase["errors"]), chk_risk_lower_phase
+
+        # Rule 7: level >= 3 risk whose guard names no gate and no T id
+        p_guard_nogate = write("test-guard-nogate.md", make_base_plan(
+            task_risk=3,
+            task_gate="echo 1",
+            risks="- K1 — danger — level 3 — guard: be careful — P1.1",
+        ))
+        chk_guard_nogate = mk("check", p_guard_nogate, code=2)
+        assert chk_guard_nogate["ok"] is False
+        assert any("level 3 risk guard 'be careful' names no gate and no T id" in e for e in chk_guard_nogate["errors"]), chk_guard_nogate
+
+        # Guard naming T1 or gate is accepted
+        p_guard_ok_t = write("test-guard-ok-t.md", make_base_plan(
+            task_risk=3,
+            task_gate="echo 1",
+            risks="- K1 — danger — level 3 — guard: T1 test suite — P1.1",
+        ))
+        assert mk("check", p_guard_ok_t)["ok"] is True
+
+        p_guard_ok_gate = write("test-guard-ok-gate.md", make_base_plan(
+            task_risk=3,
+            task_gate="echo 1",
+            risks="- K1 — danger — level 3 — guard: gate proves it — P1.1",
+        ))
+        assert mk("check", p_guard_ok_gate)["ok"] is True
+
+        # Rule 8: task at risk >= 3 no risk line names (warning)
+        p_risk3_unnamed = write("test-risk3-unnamed.md", make_base_plan(
+            task_risk=3,
+            task_gate="echo 1",
+            risks="none",
+        ))
+        chk_risk3_unnamed = mk("check", p_risk3_unnamed, code=0)
+        assert chk_risk3_unnamed["ok"] is True
+        assert any("task P1.1: risk 3 >= 3 is named by no risk line" in w for w in chk_risk3_unnamed["warnings"]), chk_risk3_unnamed
+
+        # Rule 9: unknown Log kind
+        p_bad_log = write("test-bad-log.md", make_base_plan(
+            log="- 2026-10-24 — invented_kind — custom log text — tester",
+        ))
+        chk_bad_log = mk("check", p_bad_log, code=2)
+        assert chk_bad_log["ok"] is False
+        assert any("log: unknown kind 'invented_kind'" in e for e in chk_bad_log["errors"]), chk_bad_log
+
+        # Verify all allowed log kinds pass
+        for lk in ["drafted", "decision", "answer", "override", "scope cut", "approved", "amended", "parked", "resumed"]:
+            p_lk = write(f"test-log-{lk.replace(' ', '_')}.md", make_base_plan(
+                log=f"- 2026-10-24 — {lk} — some text — tester"
+            ))
+            assert mk("check", p_lk)["ok"] is True
+
+        # Rule 10: Summary drift / legend checks (warning)
+        p_sum_phases_mismatch = write("test-sum-phases-mismatch.md", make_base_plan(
+            summary_phases="2 — P1: Phase One; P2: Phase Two",
+        ))
+        chk_sp = mk("check", p_sum_phases_mismatch, code=0)
+        assert any("Summary says 2 phases; the plan has 1" in w for w in chk_sp["warnings"]), chk_sp
+
+        p_sum_meth_off = write("test-sum-meth-off.md", make_base_plan(
+            summary_method="parallel · subagents yes",
+        ))
+        chk_sm_off = mk("check", p_sum_meth_off, code=0)
+        assert any("Summary Method value off legend" in w for w in chk_sm_off["warnings"]), chk_sm_off
+
+        p_sum_meth_disagree = write("test-sum-meth-disagree.md", make_base_plan(
+            summary_method="waves · subagents off",
+        ))
+        chk_sm_dis = mk("check", p_sum_meth_disagree, code=0)
+        assert any("Summary Method says waves · subagents off; the plan says single lane · subagents off" in w for w in chk_sm_dis["warnings"]), chk_sm_dis
+
+        p_sum_deliv_branch = write("test-sum-deliv-branch.md", make_base_plan(
+            summary_delivery="develop · pushed: no",
+        ))
+        chk_sdb = mk("check", p_sum_deliv_branch, code=0)
+        assert any("Summary Delivery branch says 'develop'; block 1 says 'main'" in w for w in chk_sdb["warnings"]), chk_sdb
+
+        p_sum_deliv_pushed = write("test-sum-deliv-pushed.md", make_base_plan(
+            summary_delivery="main · pushed: yes",
+        ))
+        chk_sdp = mk("check", p_sum_deliv_pushed, code=0)
+        assert any("Summary Delivery pushed says 'yes'; block 1 says 'no'" in w for w in chk_sdp["warnings"]), chk_sdp
+
+        # CHECK.3 approval warnings: max_build_lanes, inactive agent, undefined use gate
+        # 1. max_build_lanes: configure project YAML with max_build_lanes = 1
+        data_dir = os.environ.get("MATRIXKODER_DATA")
+        cfg_yaml_path = mkpaths.project_yaml(data_dir)
+        os.makedirs(os.path.dirname(cfg_yaml_path), exist_ok=True)
+        with open(cfg_yaml_path, "w") as f:
+            f.write("""routing_preferences:
+  max_build_lanes: 1
+gates:
+  test: pytest
+  typecheck: mypy
+  lint: eslint
+  build: vite build
+""")
+        p_2phases_wave1 = write("test-wave-exceed-lanes.md", make_base_plan(
+            summary_phases="2 — P1: Phase One; P2: Phase Two",
+            summary_method="waves · subagents off",
+            summary_lanes="P1 (own lane); P2 (own lane)",
+            extra_phases="""+++ 5.2 P2 — Phase Two
+### P2 — Phase Two
+- Goal: P2 goal
+- Serves: G1
+- Needs first: nothing
+- Build order: P2.1
+- Hazards: none
+- Carries: none
+/+++
+
++++ 5.2.0 P2 settings [toml]
+id = "P2"
+title = "Phase Two"
+wave = 1
+owned = ["src2/"]
+commit = "feat: phase two"
+subagents = false
+/+++
+
++++ 5.2.1 P2.1 — Task Two [toml]
+id = "P2.1"
+title = "Task Two"
+covers = []
+acceptance = ["outcome two"]
+risk = 1
+/+++
+""",
+        ))
+        chk_max_lanes = mk("check", p_2phases_wave1, code=0)
+        assert any("wave 1 has 2 phases, exceeds max_build_lanes (1)" in w for w in chk_max_lanes["warnings"]), chk_max_lanes
+
+        # 2. inactive agent in route
+        p_inactive_agent = write("test-inactive-agent.md", make_base_plan(
+            phase_route="unknown_bot_99 fast",
+        ))
+        chk_inactive_agent = mk("check", p_inactive_agent, code=0)
+        assert any("phase P1: route names inactive agent 'unknown_bot_99'" in w for w in chk_inactive_agent["warnings"]), chk_inactive_agent
+
+        # 3. use gate not defined by the project
+        p_undef_use_gate = write("test-undef-use-gate.md", make_base_plan(
+            summary_gates="test; typecheck; custom_missing",
+            use_gates='["test", "typecheck", "custom_missing"]',
+            gate_lines="- test — proves G1 — test line\n- typecheck — proves G1 — typecheck line\n- custom_missing — proves G1 — custom line",
+        ))
+        chk_undef_gate = mk("check", p_undef_use_gate, code=0)
+        assert any("use gate 'custom_missing' is not defined by the project" in w for w in chk_undef_gate["warnings"]), chk_undef_gate
+
+        # 4. run start refusal (run_start_check turns approval warnings into refusals)
+        _, out_undef_gate, _ = mk_plan.read_block_plan(open(p_undef_use_gate).read())
+        refusals = mk_plan.run_start_check(out_undef_gate, data_dir)
+        assert any("use gate 'custom_missing' is not defined by the project" in r for r in refusals), refusals
+        try:
+            mk_plan.run_start_check(out_undef_gate, data_dir, raise_on_error=True)
+            assert False, "expected Fail on run_start_check with raise_on_error=True"
+        except mk_plan.Fail as f:
+            assert any("use gate 'custom_missing' is not defined by the project" in str(e) for e in f.errors)
+
+        # 5. mk-config.py gates command & gates_of reader
+        r_gates = subprocess.run([sys.executable, os.path.join(HERE, "mk-config.py"), "gates"],
+                                 capture_output=True, text=True, check=True)
+        gates_json = json.loads(r_gates.stdout.strip())
+        assert gates_json["ok"] is True
+        assert set(gates_json["gates"].keys()) == {"test", "typecheck", "lint", "build"}
+        assert gates_json["gates"]["test"] == "pytest"
+        assert gates_json["gates"]["typecheck"] == "mypy"
+
+        # K7: missing gates section reads as 4 empty strings without failing
+        assert mk_config.gates_of([]) == {"test": "", "typecheck": "", "lint": "", "build": ""}
+        assert mk_config.gates_of(["repo:", "  integration_branch: main"]) == {"test": "", "typecheck": "", "lint": "", "build": ""}
 
         # T2 — copy the three project DBs read-only and assert every stored plan's file or archived version still parses
         import sqlite3, glob
