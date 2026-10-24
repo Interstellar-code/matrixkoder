@@ -362,15 +362,27 @@ def gates_of(lines):
     return out
 
 
+def project_settings_readable(data=None):
+    """True if project settings YAML exists and can be read."""
+    try:
+        data = mk_state.resolve_data(data)
+        path = project_yaml_path(data)
+        return bool(path and os.path.isfile(path) and os.access(path, os.R_OK))
+    except Exception:
+        return False
+
+
 def project_gates(data=None):
     """The {name: command} dict of gates the project defines (gates_of), read safely."""
     try:
         data = mk_state.resolve_data(data)
         path = project_yaml_path(data)
+        if not path or not os.path.isfile(path):
+            return None
         lines = read_lines(path)
         return gates_of(lines)
     except Exception:
-        return {name: "" for name in GATE_NAMES}
+        return None
 
 
 def max_build_lanes(data=None):
@@ -378,6 +390,8 @@ def max_build_lanes(data=None):
     try:
         data = mk_state.resolve_data(data)
         path = project_yaml_path(data)
+        if not path or not os.path.isfile(path):
+            return None
         lines = read_lines(path)
         load_layers(data)
         r = row_for(lines, "routing_preferences.max_build_lanes")
@@ -385,12 +399,31 @@ def max_build_lanes(data=None):
             _source, _found, val = resolve(lines, r)
             if isinstance(val, int) and val > 0:
                 return val
+        return 3
+    except Exception:
+        return None
+
+
+def integration_branch(data=None):
+    """The integration_branch from project settings, default 'main'."""
+    try:
+        data = mk_state.resolve_data(data)
+        path = project_yaml_path(data)
+        if not path or not os.path.isfile(path):
+            return "main"
+        lines = read_lines(path)
+        load_layers(data)
+        r = row_for(lines, "repo.integration_branch")
+        if r:
+            _source, _found, val = resolve(lines, r)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
     except Exception:
         pass
-    return 3
+    return "main"
 
 
-def active_agents(home=None):
+def active_agents(home=None, data=None):
     """The set of active/enabled agent names (from mk-catalog if present, else yaml/seeds defaults)."""
     try:
         home = catalog_home() if home is None else home
@@ -408,8 +441,10 @@ def active_agents(home=None):
     except Exception:
         pass
     try:
-        data = mk_state.resolve_data(None)
+        data = mk_state.resolve_data(data)
         path = project_yaml_path(data)
+        if not path or not os.path.isfile(path):
+            return None
         lines = read_lines(path)
         active = set()
         for name, m in agents(lines):
@@ -419,9 +454,10 @@ def active_agents(home=None):
                 active.add(name)
         if active:
             return active
+        return {"claude", "opencode", "agy", "omp", "herdr"}
     except Exception:
         pass
-    return {"claude", "opencode", "agy", "omp", "herdr"}
+    return None
 
 
 def rows(lines):

@@ -503,7 +503,7 @@ risk = 2
 ### DOCS — Docs and fixtures describe the new format
 - Goal: no skill, doc, README or fixture describes the old format as current, and the template is committed.
 - Serves: G5
-- Needs first: every other phase, because the docs describe what shipped.
+- Needs first: RUN, TSNEW, TSFIX (every other phase), because the docs describe what shipped.
 - Build order: DOCS.1 then DOCS.2.
 - Hazards: none
 - Carries: R1

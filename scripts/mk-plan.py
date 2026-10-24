@@ -729,17 +729,24 @@ def read_block_plan(text, sha=""):
         for line, st in filter_block_lines(b7["lines"]):
             if st.lower() == "none":
                 continue
-            m = re.match(r"^\s*-\s*(K\d+)" + DASH_SEP + r"(.*?)" + DASH_SEP + r"level\s*(\S+)" + DASH_SEP + r"guard:\s*(.*?)" + DASH_SEP + r"(.*?)\s*$", line)
+            m = re.match(r"^\s*-\s*(K\d+)" + DASH_SEP + r"(.*?)" + DASH_SEP + r"level\s*(\S+)" + DASH_SEP + r"guard:\s*(.*)$", line)
             if m:
-                risks.append({
-                    "id": m.group(1),
-                    "what": m.group(2).strip(),
-                    "level": int(m.group(3)) if m.group(3).isdigit() else m.group(3),
-                    "guard": m.group(4).strip(),
-                    "target": m.group(5).strip(),
-                    "raw": line
-                })
-                continue
+                rest = m.group(4).strip()
+                m_gt = re.search(r"^(.*)" + DASH_SEP + r"(.*?)$", rest)
+                if m_gt:
+                    guard = m_gt.group(1).strip()
+                    target = m_gt.group(2).strip()
+                    targets = [t.strip() for t in target.split(",") if t.strip()]
+                    risks.append({
+                        "id": m.group(1),
+                        "what": m.group(2).strip(),
+                        "level": int(m.group(3)) if m.group(3).isdigit() else m.group(3),
+                        "guard": guard,
+                        "target": target,
+                        "targets": targets,
+                        "raw": line
+                    })
+                    continue
             warnings.append(f"Risks block: line matches no pattern: {st!r}")
 
     # 8. Open questions
@@ -769,6 +776,8 @@ def read_block_plan(text, sha=""):
     log = []
     if b9:
         for line, st in filter_block_lines(b9["lines"]):
+            if st.lower() == "none":
+                continue
             m = re.match(r"^\s*-\s*(\S+)" + DASH_SEP + r"(.*?)" + DASH_SEP + r"(.*?)" + DASH_SEP + r"(\S+)\s*$", line)
             if m:
                 log.append({
@@ -778,6 +787,8 @@ def read_block_plan(text, sha=""):
                     "who": m.group(4).strip(),
                     "raw": line
                 })
+                continue
+            warnings.append(f"Log block: line matches no pattern: {st!r}")
 
     out = {
         "ok": True,
@@ -793,6 +804,8 @@ def read_block_plan(text, sha=""):
         "use_gates": use_gates,
         "final_gates": final_gates,
         "gate_lines": gate_lines,
+        "use_names": use_names,
+        "extra_gates": extra_gates,
         "phases": phases,
         "goals": goals,
         "goal_meta": goal_meta,
@@ -810,6 +823,7 @@ def read_block_plan(text, sha=""):
         "covers": covers_map,
         "proves": proves_map,
         "warnings": warnings,
+        "has_block_6": bool(b6 or b6_0),
     }
     for k, v in top_toml.items():
         if k not in out:
@@ -948,7 +962,7 @@ def header_parts(out):
     phases = out["phases"]
     tasks = [t for p in phases for t in p["tasks"]]
     if out.get("block_format"):
-        fg_ok = bool(out.get("use_gates")) or bool(out.get("final_gates"))
+        fg_ok = bool(out.get("gate_lines")) or is_template_plan(out)
     else:
         fg_ok = any(isinstance(g, dict) and g.get("covers") for g in out.get("final_gates") or [])
     return {"header phases": bool(phases), "tasks": bool(tasks),
@@ -1038,50 +1052,60 @@ ALLOWED_LOG_KINDS = {
 
 
 def check_settings_limits(out, data=None, home=None):
-    """The three approval-time warnings from CHECK.3:
-    - phases in one wave exceed routing_preferences.max_build_lanes
+    """The approval-time warnings from CHECK.3:
+    - project settings not readable
+    - lanes in one wave exceed routing_preferences.max_build_lanes
     - phase or task route names an agent that is not active (mk-catalog)
     - use gate is not defined by the project
     """
     if is_template_plan(out):
         return []
+    if not mk_config.project_settings_readable(data):
+        return ["project settings not readable"]
+
     warnings = []
     phases = out.get("phases") or []
     use_gates = out.get("use_gates") or []
 
     # 1. max_build_lanes
     max_lanes = mk_config.max_build_lanes(data)
-    waves = {}
-    for p in phases:
-        waves.setdefault(p.get("wave", 1), []).append(p)
-    for wave, group in sorted(waves.items()):
-        if len(group) > max_lanes:
-            warnings.append(f"wave {wave} has {len(group)} phases, exceeds max_build_lanes ({max_lanes})")
+    if max_lanes is not None:
+        waves = {}
+        for p in phases:
+            waves.setdefault(p.get("wave", 1), []).append(p)
+        for wave, group in sorted(waves.items()):
+            wave_distinct_lgs = {p["lane_group"] for p in group if p.get("lane_group")}
+            wave_no_lg = [p for p in group if not p.get("lane_group")]
+            wave_lanes = len(wave_distinct_lgs) + len(wave_no_lg)
+            if wave_lanes > max_lanes:
+                warnings.append(f"wave {wave} has {wave_lanes} lanes, exceeds max_build_lanes ({max_lanes})")
 
     # 2. active agents
     active = mk_config.active_agents(home)
-    for p in phases:
-        if p.get("route"):
-            agent = p["route"].split()[0]
-            if agent not in active:
-                warnings.append(f"phase {p.get('id')}: route names inactive agent {agent!r}")
-        for t in p.get("tasks", []):
-            if t.get("route"):
-                agent = t["route"].split()[0]
+    if active is not None:
+        for p in phases:
+            if p.get("route"):
+                agent = p["route"].split()[0]
                 if agent not in active:
-                    warnings.append(f"task {t.get('id')}: route names inactive agent {agent!r}")
-            for s in t.get("subtasks", []):
-                if s.get("route") and isinstance(s["route"], str) and s["route"].strip():
-                    agent = s["route"].split()[0]
+                    warnings.append(f"phase {p.get('id')}: route names inactive agent {agent!r}")
+            for t in p.get("tasks", []):
+                if t.get("route"):
+                    agent = t["route"].split()[0]
                     if agent not in active:
-                        warnings.append(f"subtask {s.get('id')}: route names inactive agent {agent!r}")
+                        warnings.append(f"task {t.get('id')}: route names inactive agent {agent!r}")
+                for s in t.get("subtasks", []):
+                    if s.get("route") and isinstance(s["route"], str) and s["route"].strip():
+                        agent = s["route"].split()[0]
+                        if agent not in active:
+                            warnings.append(f"subtask {s.get('id')}: route names inactive agent {agent!r}")
 
     # 3. use gate defined by project
     proj_gates = mk_config.project_gates(data)
-    for g in use_gates:
-        gid = g.get("id")
-        if gid and not proj_gates.get(gid):
-            warnings.append(f"use gate {gid!r} is not defined by the project")
+    if proj_gates is not None:
+        for g in use_gates:
+            gid = g.get("id")
+            if gid and not proj_gates.get(gid):
+                warnings.append(f"use gate {gid!r} is not defined by the project")
 
     return warnings
 
@@ -1112,14 +1136,30 @@ def check_block_plan_rules(header, out, errors, warnings, data=None, home=None):
     12. a phase or task route names an agent that is not active (warning)
     13. a use gate is not defined by the project (warning)
     """
+    if is_template_plan(out):
+        return
     phases = out.get("phases") or []
     goals = out.get("goals") or []
     items = out.get("items") or []
     risks = out.get("risks") or []
+    questions = out.get("questions") or []
     log = out.get("log") or []
     gate_lines = out.get("gate_lines") or []
     final_gates = out.get("final_gates") or []
     use_gates = out.get("use_gates") or []
+    use_names = out.get("use_names", ["test", "typecheck"])
+    extra_gates = out.get("extra_gates", {})
+    use_extra_names = set(use_names) | set(extra_gates.keys())
+    tests = out.get("tests") or [it for it in items if it.get("id", "").startswith("T")]
+
+    # Block 6 gate lines
+    if out.get("has_block_6") and not gate_lines:
+        errors.append("block 6 has no gate lines")
+    if out.get("has_block_6"):
+        gate_line_names = {gl["name"] for gl in gate_lines if gl.get("name")}
+        if gate_line_names != use_extra_names:
+            warnings.append(f"block 6 gate lines ({', '.join(sorted(gate_line_names)) or 'none'}) "
+                            f"differ from use + [extra] ({', '.join(sorted(use_extra_names)) or 'none'})")
 
     # 1. a goal no phase serves (error)
     all_served = {gid for p in phases for gid in (p.get("serves") or []) if gid}
@@ -1132,11 +1172,8 @@ def check_block_plan_rules(header, out, errors, warnings, data=None, home=None):
             errors.append(f"goal {gid} is served by no phase")
 
     # 2. a goal no gate line proves (error)
-    all_proved = {gid for gl in gate_lines for gid in gl.get("proves", []) if gid}
-    for fg in final_gates:
-        for gid in fg.get("proves", []):
-            if gid:
-                all_proved.add(gid)
+    # A goal counts as proved only by a gate line whose name is in use + [extra]
+    all_proved = {gid for gl in gate_lines if gl.get("name") in use_extra_names for gid in gl.get("proves", []) if gid}
     for g in goals:
         gid = g.get("id")
         text = g.get("text", "")
@@ -1176,45 +1213,45 @@ def check_block_plan_rules(header, out, errors, warnings, data=None, home=None):
     # 7. a level>=3 risk whose guard names no gate and no T id (error)
     task_by_id = {t["id"]: t for p in phases for t in p.get("tasks", []) if t.get("id")}
     phase_by_id = {p["id"]: p for p in phases if p.get("id")}
-    use_names = [g["id"] for g in use_gates if g.get("id")]
-    final_names = [g["id"] for g in final_gates if g.get("id")]
-    gate_line_names = [gl["name"] for gl in gate_lines if gl.get("name")]
-    all_gate_identifiers = set(use_names + final_names + gate_line_names + ["test", "typecheck", "lint", "build", "selftest"])
+    block4_t_ids = {it["id"] for it in items if it.get("id") and it["id"].startswith("T")}
 
     for r in risks:
         rid = r.get("id") or "risk"
         lvl = r.get("level")
-        target = r.get("target", "").strip()
+        raw_target = r.get("target", "").strip()
         guard = r.get("guard", "").strip()
-        if is_placeholder(target) or is_placeholder(guard):
+        if is_placeholder(raw_target) or is_placeholder(guard):
             continue
-        if isinstance(lvl, int):
-            if target in task_by_id:
-                t_risk = task_by_id[target].get("risk", 1)
-                if t_risk < lvl:
-                    errors.append(f"risk {rid}: task {target} risk ({t_risk}) is lower than risk level ({lvl})")
-            elif target in phase_by_id:
-                p_tasks = phase_by_id[target].get("tasks", [])
+        targets = r.get("targets") or [t.strip() for t in raw_target.split(",") if t.strip()]
+        for tgt in targets:
+            if is_placeholder(tgt):
+                continue
+            if tgt in task_by_id:
+                t_risk = task_by_id[tgt].get("risk", 1)
+                if isinstance(lvl, int) and t_risk < lvl:
+                    errors.append(f"risk {rid}: task {tgt} risk ({t_risk}) is lower than risk level ({lvl})")
+            elif tgt in phase_by_id:
+                p_tasks = phase_by_id[tgt].get("tasks", [])
                 max_risk = max((t.get("risk", 1) for t in p_tasks), default=1)
-                if max_risk < lvl:
-                    errors.append(f"risk {rid}: phase {target} riskiest task ({max_risk}) is lower than risk level ({lvl})")
+                if isinstance(lvl, int) and max_risk < lvl:
+                    errors.append(f"risk {rid}: phase {tgt} riskiest task ({max_risk}) is lower than risk level ({lvl})")
+            else:
+                errors.append(f"risk {rid}: target {tgt!r} is neither a task nor a phase")
 
-            # 7. level >= 3 guard check
-            if lvl >= 3:
-                has_t = bool(re.search(r"\bT\d+\b", guard))
-                has_gate_word = bool(re.search(r"\bgate\b", guard, re.I))
-                has_known_gate = any(re.search(r"\b" + re.escape(gn) + r"\b", guard, re.I) for gn in all_gate_identifiers if gn)
-                has_task_gate = False
-                if target in task_by_id:
-                    t = task_by_id[target]
-                    if t.get("gate") or t.get("manual"):
-                        if "self-test" in guard.lower() or "selftest" in guard.lower():
-                            has_task_gate = True
-                if not (has_t or has_gate_word or has_known_gate or has_task_gate):
-                    errors.append(f"risk {rid}: level {lvl} risk guard {guard!r} names no gate and no T id")
+        # 7. level >= 3 guard check
+        # pass only when the guard names a T id that exists in block 4,
+        # or a gate name from use/[extra], or the target task has its own gate.
+        # Bare words like "test" or "gate" do not count.
+        if isinstance(lvl, int) and lvl >= 3:
+            has_t = any(re.search(r"\b" + re.escape(tid) + r"\b", guard) for tid in block4_t_ids if tid)
+            has_gate_name = any(re.search(r"\b" + re.escape(gn) + r"\b", guard) for gn in use_extra_names if gn)
+            task_has_gate = any(bool(task_by_id[tgt].get("gate")) for tgt in targets if tgt in task_by_id)
+            has_task_gate = bool(re.search(r"\bgate\b", guard, re.I)) and task_has_gate
+            if not (has_t or has_gate_name or has_task_gate):
+                errors.append(f"risk {rid}: level {lvl} risk guard {guard!r} names no gate and no T id")
 
     # 8. a task at risk>=3 no risk line names (warning)
-    risk_targets = {r.get("target", "").strip() for r in risks if r.get("target")}
+    risk_targets = {tgt for r in risks for tgt in (r.get("targets") or [t.strip() for t in r.get("target", "").split(",") if t.strip()]) if tgt}
     for p in phases:
         for t in p.get("tasks", []):
             tid = t.get("id")
@@ -1245,10 +1282,23 @@ def check_block_plan_rules(header, out, errors, warnings, data=None, home=None):
             if cnt != len(phases):
                 warnings.append(f"Summary says {cnt} phases; the plan has {len(phases)}")
             rest = m_ph.group(2)
+            entries = [e.strip() for e in rest.split(";") if e.strip()]
+            phases_summary_map = {}
+            for e in entries:
+                m_ent = re.match(r"^(\S+)\s*:\s*(.*)$", e)
+                if m_ent:
+                    phases_summary_map[m_ent.group(1).strip()] = m_ent.group(2).strip()
             for p in phases:
                 pid = p.get("id")
-                if pid and not re.search(r"(?<![\w-])" + re.escape(pid) + r"(?![\w-])", rest):
+                if not pid:
+                    continue
+                if pid not in phases_summary_map and not re.search(r"(?<![\w-])" + re.escape(pid) + r"(?![\w-])", rest):
                     warnings.append(f"Summary Phases does not list phase {pid}")
+                elif pid in phases_summary_map:
+                    got_title = phases_summary_map[pid]
+                    exp_title = p.get("title", "").strip()
+                    if got_title != exp_title:
+                        warnings.append(f"Summary Phases phase {pid} title says {got_title!r}; block 5 says {exp_title!r}")
 
     raw_meth = sum_dict.get("method", "").strip()
     if raw_meth and not raw_meth.startswith("<"):
@@ -1256,7 +1306,10 @@ def check_block_plan_rules(header, out, errors, warnings, data=None, home=None):
         if not m_meth:
             warnings.append(f"Summary Method value off legend: {raw_meth!r}")
         elif phases:
-            waves_exp = "waves" if len({repr(p.get("wave", 1)) for p in phases}) > 1 else "single lane"
+            distinct_lgs = {p["lane_group"] for p in phases if p.get("lane_group")}
+            no_lg = [p for p in phases if not p.get("lane_group")]
+            total_lanes = len(distinct_lgs) + len(no_lg)
+            waves_exp = "single lane" if total_lanes <= 1 else "waves"
             subs_exp_set = {bool(p.get("subagents")) for p in phases}
             subs_exp = "mixed" if len(subs_exp_set) > 1 else ("on" if True in subs_exp_set else "off")
             got_waves = m_meth.group(1).lower()
@@ -1267,9 +1320,23 @@ def check_block_plan_rules(header, out, errors, warnings, data=None, home=None):
 
     raw_lanes = sum_dict.get("lanes", "").strip()
     if raw_lanes and not raw_lanes.startswith("<"):
+        lane_entries = [e.strip() for e in raw_lanes.split(";") if e.strip()]
+        lg_map = {}
+        for le in lane_entries:
+            m_lg = re.match(r"^(\S+)\s*:\s*(.*)$", le)
+            if m_lg:
+                members = [m.strip() for m in m_lg.group(2).split(",") if m.strip()]
+                lg_map[m_lg.group(1).strip()] = members
+
         for g in sorted({p["lane_group"] for p in phases if p.get("lane_group")}):
-            if not re.search(r"(?<![\w-])" + re.escape(g) + r"(?![\w-])", raw_lanes):
+            exp_members = [p["id"] for p in phases if p.get("lane_group") == g]
+            if g not in lg_map:
                 warnings.append(f"Summary Lanes does not name lane_group {g}")
+            else:
+                got_members = lg_map[g]
+                if set(got_members) != set(exp_members):
+                    warnings.append(f"Summary Lanes lane_group {g} members ({', '.join(sorted(got_members))}) "
+                                    f"do not match plan ({', '.join(sorted(exp_members))})")
         for p in phases:
             pid = p.get("id")
             if pid and not p.get("lane_group"):
@@ -1284,7 +1351,8 @@ def check_block_plan_rules(header, out, errors, warnings, data=None, home=None):
         else:
             branch = m_deliv.group(1).strip()
             pushed_str = m_deliv.group(2).lower()
-            exp_branch = str(out.get("integration") or "main")
+            default_branch = mk_config.integration_branch(data)
+            exp_branch = str(out.get("integration") or default_branch)
             exp_pushed = "yes" if out.get("pushed") else "no"
             if branch != exp_branch:
                 warnings.append(f"Summary Delivery branch says {branch!r}; block 1 says {exp_branch!r}")
@@ -1300,6 +1368,71 @@ def check_block_plan_rules(header, out, errors, warnings, data=None, home=None):
             fid = fg.get("id")
             if fid and not re.search(r"(?<![\w-])" + re.escape(fid) + r"(?![\w-])", raw_gates):
                 warnings.append(f"Summary Gates does not list extra gate {fid}")
+
+    # Template link rules (warnings)
+    # 1. Carries equals union of tasks' covers
+    for p in phases:
+        pid = p.get("id") or "phase"
+        p_carries = set(p.get("carries") or [])
+        tasks_covers = {cid for t in p.get("tasks", []) for cid in (t.get("covers") or []) if cid and not is_placeholder(cid)}
+        p_carries_clean = {c for c in p_carries if not is_placeholder(c)}
+        if p_carries_clean != tasks_covers:
+            warnings.append(f"phase {pid}: Carries ({', '.join(sorted(p_carries_clean)) or 'none'}) "
+                            f"does not match tasks' covers ({', '.join(sorted(tasks_covers)) or 'none'})")
+
+    # 2. Needs first must match deps
+    all_other_phase_ids = {ph["id"] for ph in phases if ph.get("id")}
+    for p in phases:
+        pid = p.get("id") or "phase"
+        p_deps = p.get("deps") or []
+        needs_first = (p.get("needs_first") or "").strip()
+        if not needs_first or is_placeholder(needs_first):
+            continue
+        mentioned_phases = {ph_id for ph_id in (all_other_phase_ids - {pid}) if re.search(r"\b" + re.escape(ph_id) + r"\b", needs_first)}
+        if p_deps:
+            for dep in p_deps:
+                if not re.search(r"\b" + re.escape(dep) + r"\b", needs_first):
+                    warnings.append(f"phase {pid}: Needs first does not mention dep {dep!r}")
+            for ph_id in mentioned_phases:
+                if ph_id not in p_deps:
+                    warnings.append(f"phase {pid}: Needs first mentions {ph_id!r} which is not in deps")
+        else:
+            if mentioned_phases:
+                warnings.append(f"phase {pid}: Needs first mentions {', '.join(sorted(mentioned_phases))} but deps is empty")
+            elif not ("nothing" in needs_first.lower() or "none" in needs_first.lower()):
+                warnings.append(f"phase {pid}: deps is empty but Needs first does not state 'nothing'")
+
+    # 3. Test plan "written by <task>" must match that task's covers
+    for t_item in tests:
+        tid = t_item.get("id")
+        text = t_item.get("text", "")
+        m_wb = re.search(r"\bwritten by\s+(\S+)", text, re.I)
+        if m_wb:
+            writer_task = m_wb.group(1).rstrip(",.;")
+            if not is_placeholder(writer_task):
+                t_obj = task_by_id.get(writer_task)
+                if t_obj:
+                    t_covers = t_obj.get("covers") or []
+                    if tid not in t_covers:
+                        warnings.append(f"test {tid} written by {writer_task}, but {writer_task} covers does not list {tid}")
+
+    # 4. Unknown IDs: G in Serves, K in Hazards, id in question's blocks:
+    all_goal_ids = {g["id"] for g in goals if g.get("id")}
+    all_risk_ids = {r["id"] for r in risks if r.get("id")}
+    all_blockable_ids = set(phase_by_id.keys()) | set(task_by_id.keys())
+    for p in phases:
+        pid = p.get("id") or "phase"
+        for gid in (p.get("serves") or []):
+            if gid and not is_placeholder(gid) and gid not in all_goal_ids:
+                warnings.append(f"phase {pid}: Serves lists unknown goal {gid!r}")
+        for kid in (p.get("hazards") or []):
+            if kid and not is_placeholder(kid) and kid not in all_risk_ids:
+                warnings.append(f"phase {pid}: Hazards lists unknown risk {kid!r}")
+    for q in questions:
+        qid = q.get("id") or "question"
+        for bid in (q.get("blocks") or []):
+            if bid and not is_placeholder(bid) and bid not in all_blockable_ids:
+                warnings.append(f"question {qid}: blocks lists unknown phase or task {bid!r}")
 
     # CHECK.3 limits warnings
     limit_warns = check_settings_limits(out, data, home)
@@ -1540,6 +1673,8 @@ def check_gate_fields(out, errors, warnings):
         manual = t.get("manual", "")
         if gates and manual:
             errors.append(f"{rid}: gate and manual are exclusive; pick one")
+        elif out.get("block_format") and risk == 5 and not gates:
+            errors.append(f"{rid}: risk 5 requires a gate command")
         elif not gates and not manual:
             if not out.get("block_format"):
                 warnings.append(f"{rid}: neither gate nor manual line")
@@ -1594,9 +1729,6 @@ def check_gate_fields(out, errors, warnings):
                 errors.append(f"{label}: covers {cid!r} is not a task in this plan")
     if not out.get("block_format"):
         if not finals:
-            warnings.append("no final_gate in the plan: F.2 wants one plan-level gate with covers")
-    else:
-        if not out.get("use_gates") and not finals:
             warnings.append("no final_gate in the plan: F.2 wants one plan-level gate with covers")
 
 
@@ -2396,7 +2528,10 @@ def approve_file(path, data, home, run, user_ack=None):
     if errors:
         raise Fail(errors, warnings=warnings)
     text, _ = load(path)
-    open_qs = unticked_questions(body_md_of(text, split_plan(text)[1]))
+    if out.get("block_format"):
+        open_qs = sum(1 for q in out.get("questions", []) if not q.get("ticked"))
+    else:
+        open_qs = unticked_questions(body_md_of(text, split_plan(text)[1]))
     if open_qs:  # a question the author lives with stays unticked: warn, never block
         warnings = warnings + [f"{open_qs} unticked open questions"]
     counts = gate_counts_of(out)
